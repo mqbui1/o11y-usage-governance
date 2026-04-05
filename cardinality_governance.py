@@ -689,6 +689,84 @@ def generate_report(findings, use_claude=True):
             trend_str += f" +{int(f['growth_pct']*100)}%"
         lines.append(f"| {i} | `{f['metric']}` | {f['mts_count']:,} | {limit_str} | {trend_str} | {sev_icon} {f['severity']} | {f['instr_source']} | `{worst}` ({worst_count:,} values) | {teams} |")
 
+    # -----------------------------------------------------------------------
+    # #10: Per-service cardinality scorecard
+    # -----------------------------------------------------------------------
+    service_mts = defaultdict(int)
+    service_metrics = defaultdict(set)
+    for f in findings:
+        for svc in f.get("attribution", {}).get("services", f["attributed_to"]):
+            service_mts[svc] += f["mts_count"]
+            service_metrics[svc].add(f["metric"])
+
+    if service_mts:
+        lines.append(f"\n## Per-Service Cardinality Scorecard\n")
+        lines.append(f"| Rank | Service | Total MTS | Affected Metrics | % of Findings Total |")
+        lines.append(f"|------|---------|-----------|-----------------|---------------------|")
+        sorted_svcs = sorted(service_mts.items(), key=lambda x: -x[1])
+        for rank, (svc, svc_total) in enumerate(sorted_svcs, 1):
+            svc_pct = round(svc_total / total_mts * 100, 1) if total_mts else 0
+            metric_count = len(service_metrics[svc])
+            lines.append(f"| {rank} | `{svc}` | {svc_total:,} | {metric_count} | {svc_pct}% |")
+
+    # -----------------------------------------------------------------------
+    # #9: Duplicate / similar metric grouping
+    # -----------------------------------------------------------------------
+    # Group by shared worst dimension
+    dim_groups = defaultdict(list)
+    for f in findings:
+        if f["worst_dim"]:
+            dim_groups[f["worst_dim"]].append(f)
+
+    # Also group by metric name prefix (strip trailing _bucket/_count/_sum/_min/_max/_total)
+    prefix_groups = defaultdict(list)
+    for f in findings:
+        stripped = re.sub(r"_(bucket|count|sum|min|max|total|created|rate)$", "", f["metric"])
+        prefix_groups[stripped].append(f)
+
+    # Only show groups with >= 2 metrics
+    dim_multi = {k: v for k, v in dim_groups.items() if len(v) >= 2}
+    prefix_multi = {k: v for k, v in prefix_groups.items() if len(v) >= 2}
+
+    if dim_multi or prefix_multi:
+        lines.append(f"\n## Duplicate / Similar Metric Groups\n")
+        lines.append("> Metrics sharing the same high-cardinality dimension — one collector fix resolves the whole group.\n")
+
+        # Shared-dimension groups
+        if dim_multi:
+            lines.append(f"### Grouped by Shared Worst Dimension\n")
+            for dim, group in sorted(dim_multi.items(), key=lambda x: -sum(f["mts_count"] for f in x[1])):
+                group_mts = sum(f["mts_count"] for f in group)
+                dim_info = group[0]["worst_dim_info"]
+                lines.append(f"#### Dimension: `{dim}` ({dim_info['unique_values']:,} unique values)")
+                if dim_info.get("pattern"):
+                    lines.append(f"**Anti-pattern detected:** {dim_info['pattern']}")
+                lines.append(f"**Combined MTS:** {group_mts:,} | **Metrics in group:** {len(group)} | One fix resolves all {len(group)}\n")
+                lines.append(f"| Metric | MTS | Severity |")
+                lines.append(f"|--------|-----|----------|")
+                for f in sorted(group, key=lambda x: -x["mts_count"]):
+                    sev_icon = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡"}.get(f["severity"], "⚪")
+                    lines.append(f"| `{f['metric']}` | {f['mts_count']:,} | {sev_icon} {f['severity']} |")
+                lines.append("")
+
+        # Metric name family groups (same stem, different suffixes)
+        if prefix_multi:
+            lines.append(f"### Grouped by Metric Family (same root name)\n")
+            for prefix, group in sorted(prefix_multi.items(), key=lambda x: -sum(f["mts_count"] for f in x[1])):
+                group_mts = sum(f["mts_count"] for f in group)
+                # Only show groups with a shared worst dim (confirms same root cause)
+                worst_dims = {f["worst_dim"] for f in group if f["worst_dim"]}
+                if not worst_dims:
+                    continue
+                lines.append(f"#### Family: `{prefix}_*`")
+                lines.append(f"**Combined MTS:** {group_mts:,} | **Variants:** {len(group)} | **Shared problem dimension(s):** `{'`, `'.join(sorted(worst_dims))}`\n")
+                lines.append(f"| Metric | MTS | Worst Dim |")
+                lines.append(f"|--------|-----|-----------|")
+                for f in sorted(group, key=lambda x: -x["mts_count"]):
+                    worst = f["worst_dim"] or "—"
+                    lines.append(f"| `{f['metric']}` | {f['mts_count']:,} | `{worst}` |")
+                lines.append("")
+
     lines.append(f"\n## Detailed Findings\n")
 
     for i, f in enumerate(findings, 1):
