@@ -20,7 +20,9 @@ High-cardinality metrics are the #1 cause of surprise overage bills in Splunk Ob
 4. **Team attribution** — maps metrics to services/teams via `service.name`, `team`, and `owner` dimensions
 5. **Trend tracking** — compares current MTS count to previous scan (stored in SQLite), flags GROWING/FALLING/NEW/STABLE
 6. **Org limit awareness** — fetches org MTS limit and shows each finding's % contribution
-7. **AI remediation** — for CRITICAL and HIGH findings, calls Claude to generate specific OTel Collector processor configs, SignalFlow rollups, and estimated MTS reduction
+7. **Per-service scorecard** — ranks services/teams by total MTS contributed across all findings, showing ownership and % of total
+8. **Duplicate metric grouping** — identifies metrics sharing the same high-cardinality dimension and groups metric families (e.g. `_bucket/_count/_sum/_min/_max` variants) — one fix resolves the whole group
+9. **AI remediation** — for CRITICAL and HIGH findings, calls Claude to generate specific OTel Collector processor configs, SignalFlow rollups, and estimated MTS reduction
 
 ## Modes
 
@@ -160,5 +162,46 @@ Reports are saved to `reports/cardinality_report_<timestamp>.md` and include:
 - **Summary table** — count by severity
 - **Trend alerts** — new metrics and growing metrics since last scan
 - **Top offenders table** — ranked with MTS count, % of org limit, trend, severity, source, worst dimension
+- **Per-service cardinality scorecard** — ranks services by total MTS contributed, affected metric count, and % of findings total
+- **Duplicate / similar metric groups** — two views:
+  - *By shared worst dimension*: all metrics with the same offending dimension grouped together with combined MTS and "one fix resolves all N" callout
+  - *By metric family*: `_bucket/_count/_sum/_min/_max/_total` variants grouped under their common root name, confirming they share the same problem dimension
 - **Detailed findings** — per-metric breakdown with dimension cardinality table and sample values
 - **AI remediation** (CRITICAL/HIGH only) — root cause, OTel Collector processor config, SignalFlow rollup, estimated MTS reduction
+
+## Per-service cardinality scorecard
+
+Shows which services own the most cardinality across all findings. Useful for directing remediation effort to the highest-impact team.
+
+```
+| Rank | Service            | Total MTS | Affected Metrics | % of Findings Total |
+|------|--------------------|-----------|-----------------|---------------------|
+| 1    | customers-service  | 3,442     | 25              | 58.9%               |
+| 2    | api-gateway        | 3,298     | 22              | 56.5%               |
+| 3    | unknown            | 2,139     | 20              | 36.6%               |
+```
+
+## Duplicate / similar metric groups
+
+Identifies metrics that share the same root cardinality problem, so a single OTel Collector processor fix resolves multiple metrics at once.
+
+**Grouped by shared worst dimension:**
+```
+#### Dimension: `server.address` (21 unique values)
+Anti-pattern detected: IP address
+Combined MTS: 1,539 | Metrics in group: 5 | One fix resolves all 5
+
+| Metric                                  | MTS   | Severity    |
+|-----------------------------------------|-------|-------------|
+| http.client.request.duration_bucket     | 1,215 | CRITICAL    |
+| http.client.request.duration_min        | 81    | CRITICAL    |
+| http.client.request.duration_count      | 81    | CRITICAL    |
+| http.client.request.duration_sum        | 81    | CRITICAL    |
+| http.client.request.duration_max        | 81    | CRITICAL    |
+```
+
+**Grouped by metric family (same root name):**
+```
+#### Family: `http.client.request.duration_*`
+Combined MTS: 1,539 | Variants: 5 | Shared problem dimension: `server.address`
+```
