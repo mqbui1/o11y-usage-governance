@@ -174,6 +174,29 @@ def db_connect():
             manual        INTEGER NOT NULL DEFAULT 0
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS ignored (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            realm      TEXT NOT NULL,
+            pattern    TEXT NOT NULL,
+            reason     TEXT NOT NULL DEFAULT '',
+            ignored_at TEXT NOT NULL,
+            UNIQUE(realm, pattern)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS scan_summaries (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            scanned_at   TEXT NOT NULL,
+            realm        TEXT NOT NULL,
+            total_metrics INTEGER NOT NULL,
+            total_mts    INTEGER NOT NULL,
+            critical     INTEGER NOT NULL DEFAULT 0,
+            high         INTEGER NOT NULL DEFAULT 0,
+            medium       INTEGER NOT NULL DEFAULT 0,
+            ignored      INTEGER NOT NULL DEFAULT 0
+        )
+    """)
     conn.commit()
     return conn
 
@@ -280,6 +303,87 @@ def db_is_resolved(metric_name):
     ).fetchone()
     conn.close()
     return row is not None
+
+
+# ---------------------------------------------------------------------------
+# Ignore list helpers
+# ---------------------------------------------------------------------------
+
+def db_ignore(pattern, reason=""):
+    """Add a metric name or glob pattern to the ignore list."""
+    conn = db_connect()
+    ts = datetime.now(timezone.utc).isoformat()
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO ignored (realm, pattern, reason, ignored_at) VALUES (?, ?, ?, ?)",
+            (REALM, pattern, reason, ts)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def db_unignore(pattern):
+    """Remove a pattern from the ignore list."""
+    conn = db_connect()
+    conn.execute("DELETE FROM ignored WHERE realm=? AND pattern=?", (REALM, pattern))
+    conn.commit()
+    conn.close()
+
+
+def db_get_ignored():
+    """Return list of (pattern, reason, ignored_at) for this realm."""
+    if not STATE_DB.exists():
+        return []
+    conn = db_connect()
+    rows = conn.execute(
+        "SELECT pattern, reason, ignored_at FROM ignored WHERE realm=? ORDER BY ignored_at",
+        (REALM,)
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def is_ignored(metric_name, ignored_patterns):
+    """Return True if metric_name matches any ignore pattern (exact or prefix glob)."""
+    import fnmatch
+    for pattern, _, _ in ignored_patterns:
+        if fnmatch.fnmatch(metric_name, pattern):
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Scan summary helpers
+# ---------------------------------------------------------------------------
+
+def db_save_summary(total_metrics, total_mts, critical, high, medium, ignored_count):
+    """Persist a per-scan summary row."""
+    conn = db_connect()
+    ts = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        """INSERT INTO scan_summaries
+               (scanned_at, realm, total_metrics, total_mts, critical, high, medium, ignored)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (ts, REALM, total_metrics, total_mts, critical, high, medium, ignored_count)
+    )
+    conn.commit()
+    conn.close()
+
+
+def db_get_scan_history(limit=30):
+    """Return the last N scan summaries, newest first."""
+    if not STATE_DB.exists():
+        return []
+    conn = db_connect()
+    rows = conn.execute(
+        """SELECT scanned_at, total_metrics, total_mts, critical, high, medium, ignored
+           FROM scan_summaries WHERE realm=?
+           ORDER BY scanned_at DESC LIMIT ?""",
+        (REALM, limit)
+    ).fetchall()
+    conn.close()
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -580,6 +684,11 @@ def scan_org(top_n=50, verbose=False):
     if mts_limit:
         print(f"  Org MTS limit: {mts_limit:,}")
 
+    # Load ignore list once before scanning
+    ignored_patterns = db_get_ignored()
+    if ignored_patterns:
+        print(f"  Ignore list: {len(ignored_patterns)} pattern(s) active")
+
     # Fetch all metrics with pagination
     print("  Fetching metric catalog (paginated)...")
     metrics = fetch_metrics()
@@ -605,6 +714,10 @@ def scan_org(top_n=50, verbose=False):
         mts_count = len(mts_list)
 
         if mts_count == 0:
+            continue
+
+        # Skip ignored metrics
+        if is_ignored(name, ignored_patterns):
             continue
 
         sev = severity(mts_count)
@@ -681,6 +794,13 @@ def scan_org(top_n=50, verbose=False):
 
     # Persist results for next run's trend comparison
     db_save_scan(top)
+
+    # Save scan summary for history tracking
+    n_critical = sum(1 for f in top if f["severity"] == "CRITICAL")
+    n_high     = sum(1 for f in top if f["severity"] == "HIGH")
+    n_medium   = sum(1 for f in top if f["severity"] == "MEDIUM")
+    n_ignored  = sum(1 for m in metrics if is_ignored(m.get("name", ""), ignored_patterns))
+    db_save_summary(len(metrics), sum(f["mts_count"] for f in top), n_critical, n_high, n_medium, n_ignored)
 
     return top
 
@@ -827,12 +947,15 @@ def generate_report(findings, use_claude=True):
         lines.append(f"**Org MTS limit:** {mts_limit:,}")
         lines.append(f"**Findings as % of org limit:** {pct_used}%")
 
+    ignored_patterns = db_get_ignored()
     lines.append(f"\n## Summary\n")
     lines.append(f"| Severity | Count |")
     lines.append(f"|----------|-------|")
     lines.append(f"| 🔴 CRITICAL (≥{CRITICAL_MTS_COUNT:,} MTS) | {len(critical)} |")
     lines.append(f"| 🟠 HIGH (≥{HIGH_MTS_COUNT:,} MTS)     | {len(high)} |")
     lines.append(f"| 🟡 MEDIUM (≥{MEDIUM_MTS_COUNT:,} MTS)   | {len(medium)} |")
+    if ignored_patterns:
+        lines.append(f"| ⚪ Ignored | {len(ignored_patterns)} pattern(s) |")
 
     # Trend summary
     growing = [f for f in findings if f.get("trend") == "GROWING"]
@@ -1098,6 +1221,33 @@ def watch_mode(interval=300, threshold=HIGH_MTS_COUNT):
 # Rollup suggestion
 # ---------------------------------------------------------------------------
 
+def show_history(limit=30):
+    """Print a table of past scan summaries."""
+    rows = db_get_scan_history(limit)
+    if not rows:
+        print("No scan history found. Run 'scan' or 'report' first.")
+        return
+
+    print(f"\nScan history (realm={REALM}, last {len(rows)} scans)\n")
+    print(f"{'Date':<22} {'Metrics':>8} {'Total MTS':>10} {'Est Cost/Mo':>12} {'🔴':>5} {'🟠':>5} {'🟡':>5} {'Ignored':>8}")
+    print("-" * 85)
+
+    for row in reversed(rows):   # oldest first for trend readability
+        scanned_at, total_metrics, total_mts, critical, high, medium, ignored = row
+        cost = total_mts * MTS_COST_PER_MONTH
+        date_str = scanned_at[:16].replace("T", " ")
+        print(f"{date_str:<22} {total_metrics:>8,} {total_mts:>10,} {f'~${cost:,.2f}':>12} {critical:>5} {high:>5} {medium:>5} {ignored:>8}")
+
+    # Trend arrow: compare first vs last
+    if len(rows) >= 2:
+        latest, oldest = rows[0], rows[-1]
+        mts_change = latest[2] - oldest[2]
+        pct = round(mts_change / oldest[2] * 100, 1) if oldest[2] else 0
+        direction = "📈 UP" if mts_change > 0 else "📉 DOWN" if mts_change < 0 else "➡️ FLAT"
+        cost_change = mts_change * MTS_COST_PER_MONTH
+        print(f"\nTrend over {len(rows)} scans: {direction} {abs(pct)}%  ({'+' if mts_change >= 0 else ''}{mts_change:,} MTS  /  {'+'if cost_change >= 0 else ''}~${cost_change:,.2f}/mo)")
+
+
 def drilldown_dimension(dimension_name, top_n=50):
     """
     Show every metric in the org that carries a given dimension,
@@ -1267,6 +1417,20 @@ def main():
     p_drill.add_argument("--dimension", required=True, help="Dimension name to drill down on (e.g. server.address)")
     p_drill.add_argument("--top", type=int, default=50, help="Show top N metrics (default: 50)")
 
+    # ignore / unignore
+    p_ignore = sub.add_parser("ignore", help="Exclude a metric or glob pattern from future reports")
+    p_ignore.add_argument("pattern", help="Metric name or glob pattern (e.g. 'sf.org.*', 'otelcol_*')")
+    p_ignore.add_argument("--reason", default="", help="Why this metric is being ignored")
+
+    p_unignore = sub.add_parser("unignore", help="Remove a metric or pattern from the ignore list")
+    p_unignore.add_argument("pattern", help="Pattern to remove")
+
+    sub.add_parser("ignored", help="List all currently ignored patterns")
+
+    # history
+    p_history = sub.add_parser("history", help="Show scan history — total MTS and cost trend over time")
+    p_history.add_argument("--limit", type=int, default=30, help="Number of past scans to show (default: 30)")
+
     args = parser.parse_args()
 
     if not TOKEN:
@@ -1307,6 +1471,29 @@ def main():
 
     elif args.command == "drilldown":
         drilldown_dimension(args.dimension, top_n=args.top)
+
+    elif args.command == "ignore":
+        db_ignore(args.pattern, reason=args.reason)
+        print(f"Ignored: '{args.pattern}'" + (f" — {args.reason}" if args.reason else ""))
+        print("This pattern will be excluded from all future scans and reports.")
+
+    elif args.command == "unignore":
+        db_unignore(args.pattern)
+        print(f"Removed '{args.pattern}' from ignore list.")
+
+    elif args.command == "ignored":
+        rows = db_get_ignored()
+        if not rows:
+            print("No patterns in ignore list.")
+        else:
+            print(f"\nIgnored patterns (realm={REALM}):\n")
+            print(f"{'Pattern':<45} {'Reason':<40} {'Since'}")
+            print("-" * 100)
+            for pattern, reason, ignored_at in rows:
+                print(f"{pattern:<45} {reason or '—':<40} {ignored_at[:10]}")
+
+    elif args.command == "history":
+        show_history(limit=args.limit)
 
     elif args.command == "resolve":
         mts_list = fetch_mts_for_metric(args.metric, limit=100)
