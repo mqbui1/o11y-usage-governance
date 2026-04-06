@@ -1169,6 +1169,413 @@ def generate_report(findings, use_claude=True):
 
 
 # ---------------------------------------------------------------------------
+# HTML report
+# ---------------------------------------------------------------------------
+
+def _h(text):
+    """HTML-escape a string."""
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+def _sev_badge(sev):
+    colors = {"CRITICAL": "#d73a49", "HIGH": "#e36209", "MEDIUM": "#b08800", "LOW": "#6a737d"}
+    icons  = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "⚪"}
+    c = colors.get(sev, "#6a737d")
+    icon = icons.get(sev, "")
+    return f'<span class="badge" style="background:{c}">{icon} {_h(sev)}</span>'
+
+
+def _trend_badge(trend, growth_pct=None):
+    icons  = {"GROWING": "📈", "FALLING": "📉", "NEW": "🆕", "STABLE": "➡️"}
+    colors = {"GROWING": "#d73a49", "FALLING": "#28a745", "NEW": "#0366d6", "STABLE": "#6a737d"}
+    icon = icons.get(trend, "")
+    c    = colors.get(trend, "#6a737d")
+    label = trend
+    if trend == "GROWING" and growth_pct:
+        label += f" +{int(growth_pct * 100)}%"
+    return f'<span class="badge" style="background:{c}">{icon} {_h(label)}</span>'
+
+
+def generate_html_report(findings, use_claude=True):
+    """Generate a self-contained HTML report with sortable tables and collapsible sections."""
+    REPORTS_DIR.mkdir(exist_ok=True)
+    ts      = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    outpath = REPORTS_DIR / f"cardinality_report_{ts}.html"
+
+    total_mts  = sum(f["mts_count"] for f in findings)
+    total_cost = total_mts * MTS_COST_PER_MONTH
+    critical   = [f for f in findings if f["severity"] == "CRITICAL"]
+    high       = [f for f in findings if f["severity"] == "HIGH"]
+    medium     = [f for f in findings if f["severity"] == "MEDIUM"]
+
+    org = fetch_org_info()
+    mts_limit = org.get("mtsCategoryInfo", {}).get("mtsLimitThreshold") \
+             or org.get("mtsLimit") or org.get("numResourcesMonitored")
+    pct_used = round(total_mts / mts_limit * 100, 1) if mts_limit else None
+
+    all_resolved    = db_get_resolved()
+    ignored_patterns = db_get_ignored()
+    saved_mts  = sum(r[1] - r[3] for r in all_resolved) if all_resolved else 0
+    saved_cost = saved_mts * MTS_COST_PER_MONTH
+
+    growing = [f for f in findings if f.get("trend") == "GROWING"]
+    new_metrics = [f for f in findings if f.get("trend") == "NEW"]
+
+    # ---- CSS + JS ----
+    css = """
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+           background: #f6f8fa; color: #24292e; line-height: 1.5; }
+    .container { max-width: 1400px; margin: 0 auto; padding: 24px; }
+    h1 { font-size: 1.8rem; margin-bottom: 4px; }
+    h2 { font-size: 1.3rem; margin: 28px 0 12px; border-bottom: 2px solid #e1e4e8; padding-bottom: 6px; }
+    h3 { font-size: 1.1rem; margin: 20px 0 8px; color: #444; }
+    .meta { color: #586069; font-size: 0.9rem; margin-bottom: 20px; }
+    .cards { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 24px; }
+    .card { background: #fff; border: 1px solid #e1e4e8; border-radius: 8px;
+            padding: 16px 20px; min-width: 160px; flex: 1; }
+    .card .value { font-size: 1.8rem; font-weight: 700; }
+    .card .label { font-size: 0.8rem; color: #586069; text-transform: uppercase; letter-spacing: .05em; }
+    .card.red   { border-top: 4px solid #d73a49; }
+    .card.orange{ border-top: 4px solid #e36209; }
+    .card.yellow{ border-top: 4px solid #b08800; }
+    .card.green { border-top: 4px solid #28a745; }
+    .card.blue  { border-top: 4px solid #0366d6; }
+    table { width: 100%; border-collapse: collapse; background: #fff;
+            border: 1px solid #e1e4e8; border-radius: 8px; overflow: hidden;
+            font-size: 0.875rem; margin-bottom: 20px; }
+    th { background: #f6f8fa; padding: 10px 12px; text-align: left;
+         border-bottom: 2px solid #e1e4e8; white-space: nowrap; cursor: pointer; user-select: none; }
+    th:hover { background: #eaecef; }
+    th.sort-asc::after  { content: " ▲"; font-size: 0.7em; }
+    th.sort-desc::after { content: " ▼"; font-size: 0.7em; }
+    td { padding: 8px 12px; border-bottom: 1px solid #f0f0f0; vertical-align: top; }
+    tr:last-child td { border-bottom: none; }
+    tr:hover td { background: #f9fafb; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 12px;
+             font-size: 0.75rem; font-weight: 600; color: #fff; white-space: nowrap; }
+    .metric-name { font-family: 'SFMono-Regular', Consolas, monospace; font-size: 0.82rem; }
+    .dim-name    { font-family: 'SFMono-Regular', Consolas, monospace; font-size: 0.82rem;
+                   background: #f3f4f6; padding: 1px 5px; border-radius: 4px; }
+    details { margin: 8px 0; }
+    summary { cursor: pointer; font-weight: 600; color: #0366d6; padding: 6px 0; }
+    summary:hover { text-decoration: underline; }
+    pre { background: #1e2030; color: #cdd6f4; padding: 14px 16px; border-radius: 6px;
+          font-size: 0.8rem; overflow-x: auto; white-space: pre; margin: 8px 0; }
+    .alert { background: #fff8c5; border: 1px solid #f0c000; border-radius: 6px;
+             padding: 10px 14px; margin-bottom: 12px; font-size: 0.9rem; }
+    .alert.green { background: #dcffe4; border-color: #28a745; }
+    .alert.red   { background: #ffeef0; border-color: #d73a49; }
+    .group-box { background: #fff; border: 1px solid #e1e4e8; border-radius: 8px;
+                 padding: 16px; margin-bottom: 16px; }
+    .group-box h4 { font-size: 1rem; margin-bottom: 8px; }
+    .savings-banner { background: #dcffe4; border: 1px solid #28a745; border-radius: 8px;
+                      padding: 12px 16px; margin-bottom: 20px; font-size: 1rem; }
+    .tab-nav { display: flex; gap: 4px; border-bottom: 2px solid #e1e4e8; margin-bottom: 20px; }
+    .tab-btn { padding: 8px 16px; cursor: pointer; border: none; background: none;
+               font-size: 0.9rem; color: #586069; border-bottom: 3px solid transparent;
+               margin-bottom: -2px; font-weight: 500; }
+    .tab-btn.active { color: #0366d6; border-bottom-color: #0366d6; }
+    .tab-pane { display: none; }
+    .tab-pane.active { display: block; }
+    @media (max-width: 768px) { .cards { flex-direction: column; } }
+    """
+
+    js = """
+    // Tab switching
+    function showTab(id) {
+        document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+        document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+        document.getElementById(id).classList.add('active');
+        event.target.classList.add('active');
+    }
+
+    // Table sorting
+    document.querySelectorAll('th[data-sort]').forEach(th => {
+        th.addEventListener('click', () => {
+            const table = th.closest('table');
+            const col   = Array.from(th.parentElement.children).indexOf(th);
+            const asc   = th.classList.toggle('sort-asc');
+            th.classList.toggle('sort-desc', !asc);
+            th.parentElement.querySelectorAll('th').forEach(t => {
+                if (t !== th) { t.classList.remove('sort-asc', 'sort-desc'); }
+            });
+            const tbody = table.querySelector('tbody');
+            const rows  = Array.from(tbody.querySelectorAll('tr'));
+            rows.sort((a, b) => {
+                const av = a.cells[col]?.dataset.val ?? a.cells[col]?.textContent ?? '';
+                const bv = b.cells[col]?.dataset.val ?? b.cells[col]?.textContent ?? '';
+                const an = parseFloat(av), bn = parseFloat(bv);
+                if (!isNaN(an) && !isNaN(bn)) return asc ? an - bn : bn - an;
+                return asc ? av.localeCompare(bv) : bv.localeCompare(av);
+            });
+            rows.forEach(r => tbody.appendChild(r));
+        });
+    });
+    """
+
+    # ---- Build HTML sections ----
+    def stat_card(value, label, cls="blue"):
+        return f'<div class="card {cls}"><div class="value">{_h(value)}</div><div class="label">{_h(label)}</div></div>'
+
+    # Header cards
+    cards_html = '<div class="cards">'
+    cards_html += stat_card(f"{total_mts:,}", "Total MTS", "red" if critical else "orange")
+    cards_html += stat_card(f"~${total_cost:,.2f}", "Est. Cost / Mo", "orange")
+    cards_html += stat_card(str(len(critical)), "Critical", "red")
+    cards_html += stat_card(str(len(high)), "High", "orange")
+    cards_html += stat_card(str(len(medium)), "Medium", "yellow")
+    if saved_mts:
+        cards_html += stat_card(f"~${saved_cost:,.2f}", "Saved / Mo", "green")
+    if pct_used is not None:
+        cards_html += stat_card(f"{pct_used}%", "% of Org Limit", "blue")
+    cards_html += "</div>"
+
+    # Alerts
+    alerts_html = ""
+    if growing:
+        names = ", ".join(f"<code>{_h(f['metric'])}</code>" for f in growing[:3])
+        alerts_html += f'<div class="alert red">📈 <strong>{len(growing)} metric(s) growing &gt;20%</strong> since last scan: {names}{"..." if len(growing) > 3 else ""}</div>'
+    if new_metrics:
+        alerts_html += f'<div class="alert">🆕 <strong>{len(new_metrics)} new metric(s)</strong> appeared since last scan</div>'
+    if saved_mts:
+        alerts_html += f'<div class="alert green">🎉 <strong>Cumulative savings:</strong> {saved_mts:,} MTS / ~${saved_cost:,.2f}/mo across {len(all_resolved)} resolved metric(s)</div>'
+
+    # Top offenders table
+    def offenders_table(rows, limit=None):
+        h = '<table><thead><tr>'
+        h += '<th data-sort>Rank</th><th data-sort>Metric</th><th data-sort>MTS</th>'
+        h += '<th data-sort>Est. Cost/Mo</th><th data-sort>Severity</th>'
+        h += '<th data-sort>Trend</th><th data-sort>Source</th>'
+        h += '<th data-sort>Worst Dimension</th><th>Services</th></tr></thead><tbody>'
+        for i, f in enumerate(rows[:limit] if limit else rows, 1):
+            worst = f["worst_dim"] or "—"
+            worst_count = f["worst_dim_info"]["unique_values"] if f["worst_dim_info"] else 0
+            services = ", ".join(f["attributed_to"][:2])
+            cost = f["mts_count"] * MTS_COST_PER_MONTH
+            h += f'<tr>'
+            h += f'<td data-val="{i}">{i}</td>'
+            h += f'<td><span class="metric-name">{_h(f["metric"])}</span></td>'
+            h += f'<td data-val="{f["mts_count"]}">{f["mts_count"]:,}</td>'
+            h += f'<td data-val="{cost}">~${cost:,.2f}</td>'
+            h += f'<td>{_sev_badge(f["severity"])}</td>'
+            h += f'<td>{_trend_badge(f.get("trend",""), f.get("growth_pct"))}</td>'
+            h += f'<td>{_h(f["instr_source"])}</td>'
+            h += f'<td><span class="dim-name">{_h(worst)}</span> ({worst_count:,})</td>'
+            h += f'<td>{_h(services)}</td>'
+            h += '</tr>'
+        h += '</tbody></table>'
+        return h
+
+    # Service scorecard
+    service_mts     = defaultdict(int)
+    service_metrics = defaultdict(set)
+    for f in findings:
+        for svc in f.get("attribution", {}).get("services", f["attributed_to"]):
+            service_mts[svc]     += f["mts_count"]
+            service_metrics[svc].add(f["metric"])
+
+    def scorecard_table():
+        h = '<table><thead><tr><th data-sort>Rank</th><th data-sort>Service</th>'
+        h += '<th data-sort>Total MTS</th><th data-sort>Est. Cost/Mo</th>'
+        h += '<th data-sort>Metrics</th><th data-sort>% of Total</th></tr></thead><tbody>'
+        for rank, (svc, svc_total) in enumerate(sorted(service_mts.items(), key=lambda x: -x[1]), 1):
+            pct    = round(svc_total / total_mts * 100, 1) if total_mts else 0
+            cost   = svc_total * MTS_COST_PER_MONTH
+            n_metrics = len(service_metrics[svc])
+            bar    = f'<div style="height:6px;background:#0366d6;width:{pct}%;border-radius:3px;margin-top:4px"></div>'
+            h += f'<tr><td>{rank}</td><td><code>{_h(svc)}</code></td>'
+            h += f'<td data-val="{svc_total}">{svc_total:,}</td>'
+            h += f'<td data-val="{cost}">~${cost:,.2f}</td>'
+            h += f'<td>{n_metrics}</td>'
+            h += f'<td data-val="{pct}">{pct}%{bar}</td></tr>'
+        h += '</tbody></table>'
+        return h
+
+    # Resolved findings table
+    def resolved_table():
+        if not all_resolved:
+            return '<p style="color:#586069">No resolved findings yet.</p>'
+        current_map = {f["metric"]: f["mts_count"] for f in findings}
+        h = '<table><thead><tr><th>Metric</th><th data-sort>Peak MTS</th>'
+        h += '<th data-sort>Current MTS</th><th data-sort>MTS Saved</th>'
+        h += '<th data-sort>Cost Saved/Mo</th><th data-sort>Reduction</th>'
+        h += '<th>Resolved At</th><th>How</th></tr></thead><tbody>'
+        for row in all_resolved:
+            metric, peak_mts, peak_at, resolved_mts, resolved_at, reduction_pct, manual = row
+            current   = current_map.get(metric, resolved_mts)
+            mts_saved = peak_mts - current
+            cost_saved = mts_saved * MTS_COST_PER_MONTH
+            how = "manual" if manual else "auto"
+            h += f'<tr><td><span class="metric-name">{_h(metric)}</span></td>'
+            h += f'<td data-val="{peak_mts}">{peak_mts:,}</td>'
+            h += f'<td data-val="{current}">{current:,}</td>'
+            h += f'<td data-val="{mts_saved}">{mts_saved:,}</td>'
+            h += f'<td data-val="{cost_saved}">~${cost_saved:,.2f}</td>'
+            h += f'<td data-val="{reduction_pct}">-{reduction_pct}%</td>'
+            h += f'<td>{_h(resolved_at[:10])}</td><td>{_h(how)}</td></tr>'
+        h += '</tbody></table>'
+        return h
+
+    # Duplicate groups
+    dim_groups    = defaultdict(list)
+    prefix_groups = defaultdict(list)
+    for f in findings:
+        if f["worst_dim"]:
+            dim_groups[f["worst_dim"]].append(f)
+        stripped = re.sub(r"_(bucket|count|sum|min|max|total|created|rate)$", "", f["metric"])
+        prefix_groups[stripped].append(f)
+    dim_multi    = {k: v for k, v in dim_groups.items() if len(v) >= 2}
+    prefix_multi = {k: v for k, v in prefix_groups.items() if len(v) >= 2}
+
+    def groups_html():
+        h = ""
+        if dim_multi:
+            h += "<h3>Grouped by Shared Worst Dimension</h3>"
+            for dim, group in sorted(dim_multi.items(), key=lambda x: -sum(f["mts_count"] for f in x[1])):
+                group_mts = sum(f["mts_count"] for f in group)
+                dim_info  = group[0]["worst_dim_info"]
+                fix       = generate_fix_yaml(dim, [f["metric"] for f in group], dim_info)
+                pat_badge = f' <span class="badge" style="background:#d73a49">{_h(dim_info["pattern"])}</span>' if dim_info.get("pattern") else ""
+                h += f'<div class="group-box">'
+                h += f'<h4><span class="dim-name">{_h(dim)}</span> &mdash; {dim_info["unique_values"]:,} unique values{pat_badge}</h4>'
+                h += f'<p style="margin-bottom:8px"><strong>{group_mts:,} combined MTS</strong> &middot; {len(group)} metrics &middot; <em>one fix resolves all {len(group)}</em></p>'
+                h += '<table><thead><tr><th>Metric</th><th data-sort>MTS</th><th>Severity</th></tr></thead><tbody>'
+                for f in sorted(group, key=lambda x: -x["mts_count"]):
+                    h += f'<tr><td><span class="metric-name">{_h(f["metric"])}</span></td>'
+                    h += f'<td data-val="{f["mts_count"]}">{f["mts_count"]:,}</td>'
+                    h += f'<td>{_sev_badge(f["severity"])}</td></tr>'
+                h += '</tbody></table>'
+                h += f'<details><summary>Fix: drop <code>{_h(dim)}</code> (OTel Collector YAML)</summary>'
+                h += f'<pre>{_h(fix["filter_processor"])}</pre>'
+                h += f'<details><summary>Alternative: hash instead of drop</summary>'
+                h += f'<pre>{_h(fix["transform_processor"])}</pre></details>'
+                h += '</details></div>'
+        return h
+
+    # Detailed findings
+    def detailed_html():
+        h = ""
+        for i, f in enumerate(findings, 1):
+            attr = f.get("attribution", {})
+            sev  = f["severity"]
+            trend_str = f.get("trend", "")
+            if f.get("prev_count") is not None and f.get("growth_pct") is not None:
+                pct = int(f["growth_pct"] * 100)
+                trend_str += f" ({f['prev_count']:,} → {f['mts_count']:,}, {'+' if pct >= 0 else ''}{pct}%)"
+            cost = f["mts_count"] * MTS_COST_PER_MONTH
+
+            h += f'<details><summary>{i}. <span class="metric-name">{_h(f["metric"])}</span> &nbsp; {_sev_badge(sev)} &nbsp; {f["mts_count"]:,} MTS &nbsp; ~${cost:,.2f}/mo</summary>'
+            h += '<div style="padding:12px 0">'
+            h += f'<p><strong>Instrumentation:</strong> {_h(f["instr_source"])} &mdash; <em>{_h(f["instr_desc"])}</em></p>'
+            h += f'<p><strong>Trend:</strong> {_trend_badge(f.get("trend",""), f.get("growth_pct"))} {_h(trend_str)}</p>'
+            h += f'<p><strong>Services:</strong> {_h(", ".join(attr.get("services", f["attributed_to"])))}</p>'
+            if attr.get("environments"):
+                h += f'<p><strong>Environments:</strong> {_h(", ".join(attr["environments"]))}</p>'
+            if attr.get("clusters"):
+                h += f'<p><strong>Clusters:</strong> {_h(", ".join(attr["clusters"]))}</p>'
+            if attr.get("sdk"):
+                h += f'<p><strong>SDK:</strong> {_h(attr["sdk"])}</p>'
+
+            if f["dimensions"]:
+                h += '<table style="margin-top:10px"><thead><tr><th>Dimension</th><th data-sort>Unique Values</th><th>Pattern</th><th>Sample Values</th></tr></thead><tbody>'
+                for dim, info in list(f["dimensions"].items())[:8]:
+                    pattern = info["pattern"] or "—"
+                    samples = ", ".join(f"<code>{_h(v)}</code>" for v in info["sample_values"][:3])
+                    h += f'<tr><td><span class="dim-name">{_h(dim)}</span></td>'
+                    h += f'<td data-val="{info["unique_values"]}">{info["unique_values"]:,}</td>'
+                    h += f'<td>{_h(pattern)}</td><td>{samples}</td></tr>'
+                h += '</tbody></table>'
+
+            if use_claude and sev in ("CRITICAL", "HIGH"):
+                print(f"  Generating AI remediation for {f['metric']}...")
+                remediation = generate_remediation(f)
+                h += f'<details style="margin-top:10px"><summary>AI Remediation</summary><pre>{_h(remediation)}</pre></details>'
+
+            h += '</div></details>'
+        return h
+
+    # Ignored patterns
+    def ignored_html():
+        if not ignored_patterns:
+            return '<p style="color:#586069">No patterns in ignore list.</p>'
+        h = '<table><thead><tr><th>Pattern</th><th>Reason</th><th>Since</th></tr></thead><tbody>'
+        for pattern, reason, ignored_at in ignored_patterns:
+            h += f'<tr><td><code>{_h(pattern)}</code></td><td>{_h(reason or "—")}</td><td>{_h(ignored_at[:10])}</td></tr>'
+        h += '</tbody></table>'
+        return h
+
+    gen_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    limit_line = f" &middot; Org limit: {mts_limit:,} ({pct_used}% used)" if mts_limit else ""
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Cardinality Governance Report — {_h(REALM)}</title>
+<style>{css}</style>
+</head>
+<body>
+<div class="container">
+  <h1>Metric Cardinality Governance</h1>
+  <div class="meta">Generated {_h(gen_time)} &middot; Realm: <strong>{_h(REALM)}</strong> &middot; {len(findings)} metrics analyzed{limit_line}</div>
+
+  {cards_html}
+  {alerts_html}
+
+  <div class="tab-nav">
+    <button class="tab-btn active" onclick="showTab('tab-offenders')">Top Offenders</button>
+    <button class="tab-btn" onclick="showTab('tab-scorecard')">Service Scorecard</button>
+    <button class="tab-btn" onclick="showTab('tab-groups')">Duplicate Groups</button>
+    <button class="tab-btn" onclick="showTab('tab-resolved')">Resolved ({len(all_resolved)})</button>
+    <button class="tab-btn" onclick="showTab('tab-details')">Detailed Findings</button>
+    <button class="tab-btn" onclick="showTab('tab-ignored')">Ignored ({len(ignored_patterns)})</button>
+  </div>
+
+  <div id="tab-offenders" class="tab-pane active">
+    <h2>Top Offenders</h2>
+    {offenders_table(findings, limit=50)}
+  </div>
+
+  <div id="tab-scorecard" class="tab-pane">
+    <h2>Per-Service Cardinality Scorecard</h2>
+    {scorecard_table()}
+  </div>
+
+  <div id="tab-groups" class="tab-pane">
+    <h2>Duplicate / Similar Metric Groups</h2>
+    <p style="margin-bottom:16px;color:#586069">Metrics sharing the same high-cardinality dimension — one collector fix resolves the whole group.</p>
+    {groups_html()}
+  </div>
+
+  <div id="tab-resolved" class="tab-pane">
+    <h2>Resolved Findings</h2>
+    {resolved_table()}
+  </div>
+
+  <div id="tab-details" class="tab-pane">
+    <h2>Detailed Findings</h2>
+    <p style="margin-bottom:12px;color:#586069">Click a metric to expand dimension analysis and AI remediation.</p>
+    {detailed_html()}
+  </div>
+
+  <div id="tab-ignored" class="tab-pane">
+    <h2>Ignored Patterns</h2>
+    {ignored_html()}
+  </div>
+
+  <p style="margin-top:32px;color:#586069;font-size:0.8rem">Generated by Metric Cardinality Governance &mdash; Splunk Observability Cloud</p>
+</div>
+<script>{js}</script>
+</body>
+</html>"""
+
+    outpath.write_text(html)
+    return outpath
+
+
+# ---------------------------------------------------------------------------
 # Watch mode
 # ---------------------------------------------------------------------------
 
@@ -1394,9 +1801,11 @@ def main():
     p_scan.add_argument("--verbose", action="store_true", help="Show all metrics including LOW severity")
 
     # report
-    p_report = sub.add_parser("report", help="Generate full Markdown report with AI remediation")
+    p_report = sub.add_parser("report", help="Generate full Markdown or HTML report with AI remediation")
     p_report.add_argument("--top", type=int, default=50, help="Analyze top N metrics (default: 50)")
     p_report.add_argument("--no-ai", action="store_true", help="Skip AI remediation (faster)")
+    p_report.add_argument("--format", choices=["md", "html", "both"], default="md",
+                          help="Output format: md (default), html, or both")
 
     # watch
     p_watch = sub.add_parser("watch", help="Continuously monitor for cardinality explosions")
@@ -1460,8 +1869,18 @@ def main():
             print("No cardinality issues found.")
             return
         print(f"\nGenerating report for {len(findings)} findings...")
-        outpath, _ = generate_report(findings, use_claude=not args.no_ai)
-        print(f"\nReport saved to: {outpath}")
+        fmt = args.format
+        if fmt in ("md", "both"):
+            outpath, _ = generate_report(findings, use_claude=not args.no_ai)
+            print(f"Markdown report: {outpath}")
+        if fmt in ("html", "both"):
+            html_path = generate_html_report(findings, use_claude=not args.no_ai and fmt == "html")
+            print(f"HTML report:     {html_path}")
+            try:
+                import subprocess
+                subprocess.Popen(["open", str(html_path)])
+            except Exception:
+                pass
 
     elif args.command == "watch":
         watch_mode(interval=args.interval, threshold=args.threshold)
