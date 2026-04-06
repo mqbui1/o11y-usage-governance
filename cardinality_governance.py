@@ -1787,6 +1787,244 @@ Return ONLY the content, no preamble."""
     print(result)
 
 
+
+# ---------------------------------------------------------------------------
+# MTS spike comparison
+# ---------------------------------------------------------------------------
+
+def db_get_snapshot_near_date(target_date_str):
+    """
+    Return a dict {metric: mts_count} from the scan run closest to target_date_str.
+    target_date_str: 'YYYY-MM-DD' or 'YYYY-MM-DDTHH:MM'
+    Returns (snapshot_dict, actual_scanned_at) or ({}, None) if no data.
+    """
+    if not STATE_DB.exists():
+        return {}, None
+    conn = db_connect()
+    row = conn.execute(
+        """SELECT scanned_at FROM scans
+           WHERE realm=?
+           ORDER BY ABS(JULIANDAY(scanned_at) - JULIANDAY(?)) ASC
+           LIMIT 1""",
+        (REALM, target_date_str)
+    ).fetchone()
+    if not row:
+        conn.close()
+        return {}, None
+    nearest_ts = row[0]
+    rows = conn.execute(
+        """SELECT metric, mts_count FROM scans
+           WHERE realm=? AND ABS(JULIANDAY(scanned_at) - JULIANDAY(?)) < 0.001
+           ORDER BY mts_count DESC""",
+        (REALM, nearest_ts)
+    ).fetchall()
+    conn.close()
+    snapshot = {r[0]: r[1] for r in rows}
+    return snapshot, nearest_ts
+
+
+def fetch_live_snapshot(verbose=False):
+    """
+    Lightweight live snapshot: fetch all metrics + MTS counts without full analysis.
+    Returns dict {metric_name: {"mts_count": N, "source": str, "services": [str], "token": str}}
+    """
+    tokens = fetch_tokens()
+    token_map = {t.get("id", ""): t.get("name", "") for t in tokens}
+
+    metrics = fetch_metrics()
+    if not metrics:
+        return {}
+
+    snapshot = {}
+    total = len(metrics)
+    for i, metric in enumerate(metrics):
+        name = metric.get("name", "")
+        if verbose:
+            print(f"  [{i+1}/{total}] {name}", end="\r", flush=True)
+        mts_list  = fetch_mts_for_metric(name, limit=10000)
+        mts_count = len(mts_list)
+        if mts_count == 0:
+            continue
+        source, _ = infer_instrumentation_source(name, mts_list)
+        services  = attribute_to_team(mts_list, tokens)
+        token_name = ""
+        for mts in mts_list[:20]:
+            tid = mts.get("dimensions", {}).get("tokenId", "")
+            if tid and tid in token_map:
+                token_name = token_map[tid]
+                break
+        snapshot[name] = {
+            "mts_count": mts_count,
+            "source":    source,
+            "services":  services,
+            "token":     token_name,
+        }
+    if verbose:
+        print()
+    return snapshot
+
+
+def compare_snapshots(snap1, snap2):
+    """
+    Join two snapshots and return list of deltas, sorted by MTS increase desc.
+    snap1/snap2: dict {metric: {"mts_count": N, ...}} or {metric: N} (from DB)
+    Returns list of dicts with delta info.
+    """
+    def count(snap, key):
+        v = snap.get(key, 0)
+        return v if isinstance(v, int) else v.get("mts_count", 0)
+
+    def meta(snap, key):
+        v = snap.get(key, {})
+        if isinstance(v, int):
+            return {"source": "unknown", "services": [], "token": ""}
+        return v
+
+    all_keys = set(snap1) | set(snap2)
+    deltas = []
+    for metric in all_keys:
+        mts1  = count(snap1, metric)
+        mts2  = count(snap2, metric)
+        delta = mts2 - mts1
+        pct   = round((delta / mts1 * 100), 1) if mts1 > 0 else (100.0 if mts2 > 0 else 0.0)
+        info  = meta(snap2, metric) if metric in snap2 else meta(snap1, metric)
+        deltas.append({
+            "metric":     metric,
+            "mts1":       mts1,
+            "mts2":       mts2,
+            "delta":      delta,
+            "pct_change": pct,
+            "source":     info.get("source", "unknown"),
+            "services":   info.get("services", []),
+            "token":      info.get("token", ""),
+        })
+    return deltas
+
+
+def cmd_compare(date1, date2, top_n=20, min_delta=100, show_new=True, show_dropped=False):
+    """
+    Compare MTS counts between two dates and show what drove spikes.
+    """
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    print(f"\nMTS Spike Comparison  (realm={REALM})  generated {now_str}\n")
+
+    LIVE_SENTINEL = "now"
+
+    def load_snapshot(date_str, label):
+        if date_str.lower() == LIVE_SENTINEL:
+            print(f"  Fetching live snapshot for {label}...")
+            snap = fetch_live_snapshot(verbose=True)
+            ts   = datetime.now(timezone.utc).isoformat()
+            print(f"  Live snapshot: {len(snap):,} metrics")
+            return snap, ts
+        else:
+            snap, ts = db_get_snapshot_near_date(date_str)
+            if snap:
+                print(f"  Loaded stored snapshot for {label}: {len(snap):,} metrics from {ts[:16]}")
+            else:
+                print(f"  No stored snapshot near '{date_str}' — fetching live instead...")
+                snap = fetch_live_snapshot(verbose=True)
+                ts   = datetime.now(timezone.utc).isoformat()
+                print(f"  Live snapshot: {len(snap):,} metrics")
+            return snap, ts
+
+    snap1, ts1 = load_snapshot(date1, "baseline")
+    snap2, ts2 = load_snapshot(date2, "compared")
+
+    if not snap1 and not snap2:
+        print("\nNo data available for either date. Run 'scan' first to build history.")
+        return
+
+    print()
+    deltas = compare_snapshots(snap1, snap2)
+
+    increased    = sorted([d for d in deltas if d["delta"] >= min_delta], key=lambda x: -x["delta"])
+    new_metrics  = [d for d in deltas if d["mts1"] == 0 and d["mts2"] > 0]
+    dropped      = sorted([d for d in deltas if d["delta"] <= -min_delta], key=lambda x: x["delta"])
+
+    total_mts1  = sum(d["mts1"] for d in deltas)
+    total_mts2  = sum(d["mts2"] for d in deltas)
+    total_delta = total_mts2 - total_mts1
+    total_pct   = round(total_delta / total_mts1 * 100, 1) if total_mts1 > 0 else 0.0
+
+    arrow = "+" if total_delta >= 0 else "-"
+    cost1 = estimate_cost(total_mts1)
+    cost2 = estimate_cost(total_mts2)
+    print(f"  Baseline  ({ts1[:16]}):  {total_mts1:>10,} MTS   {cost1}")
+    print(f"  Compared  ({ts2[:16]}):  {total_mts2:>10,} MTS   {cost2}")
+    print(f"  Net change:               {arrow}{abs(total_delta):>9,} MTS  ({total_pct:+.1f}%)   "
+          f"{estimate_cost(abs(total_delta))} {'added' if total_delta >= 0 else 'saved'}")
+    print()
+
+    if increased:
+        print("=" * 120)
+        print(f"  TOP MTS INCREASES  (>={min_delta:,} MTS delta)  --  {len(increased)} metric(s)")
+        print("=" * 120)
+        print(f"{'Rank':<5} {'Metric':<48} {'Baseline':>10} {'Current':>10} {'Delta':>10} {'Change':>8}  "
+              f"{'Source':<25} {'Services / Token'}")
+        print("-" * 145)
+        for i, d in enumerate(increased[:top_n], 1):
+            svc_str = ", ".join(d["services"][:3]) if d["services"] else "--"
+            if d["token"]:
+                svc_str += f" [{d['token']}]"
+            pct_str  = f"+{d['pct_change']:.1f}%" if d["mts1"] > 0 else "NEW"
+            base_str = f"{d['mts1']:,}" if d["mts1"] > 0 else "--"
+            print(f"{i:<5} {d['metric']:<48} {base_str:>10} {d['mts2']:>10,} {d['delta']:>+10,} "
+                  f"{pct_str:>8}  {d['source']:<25} {svc_str}")
+        print()
+
+        by_source = defaultdict(lambda: {"metrics": 0, "delta": 0})
+        for d in increased:
+            by_source[d["source"]]["metrics"] += 1
+            by_source[d["source"]]["delta"]   += d["delta"]
+        print(f"  Source breakdown for increased metrics:")
+        print(f"  {'Source':<30} {'Metrics':>8} {'MTS Added':>12} {'Cost Added':>14}")
+        print("  " + "-" * 68)
+        for src, info in sorted(by_source.items(), key=lambda x: -x[1]["delta"]):
+            print(f"  {src:<30} {info['metrics']:>8} {info['delta']:>12,} {estimate_cost(info['delta']):>14}/mo")
+        print()
+
+        by_token = defaultdict(lambda: {"metrics": 0, "delta": 0})
+        for d in increased:
+            tk = d["token"] or "(unknown token)"
+            by_token[tk]["metrics"] += 1
+            by_token[tk]["delta"]   += d["delta"]
+        if not (len(by_token) == 1 and "(unknown token)" in by_token):
+            print(f"  Token breakdown for increased metrics:")
+            print(f"  {'Token':<35} {'Metrics':>8} {'MTS Added':>12}")
+            print("  " + "-" * 58)
+            for tk, info in sorted(by_token.items(), key=lambda x: -x[1]["delta"]):
+                print(f"  {tk:<35} {info['metrics']:>8} {info['delta']:>12,}")
+            print()
+
+    if show_new and new_metrics:
+        print("=" * 120)
+        print(f"  NEW METRICS  (first seen in compared snapshot)  --  {len(new_metrics)} metric(s)")
+        print("=" * 120)
+        print(f"{'Rank':<5} {'Metric':<48} {'MTS':>10}  {'Source':<25} {'Services / Token'}")
+        print("-" * 110)
+        for i, d in enumerate(sorted(new_metrics, key=lambda x: -x["mts2"])[:top_n], 1):
+            svc_str = ", ".join(d["services"][:3]) if d["services"] else "--"
+            if d["token"]:
+                svc_str += f" [{d['token']}]"
+            print(f"{i:<5} {d['metric']:<48} {d['mts2']:>10,}  {d['source']:<25} {svc_str}")
+        print()
+
+    if show_dropped and dropped:
+        print("=" * 120)
+        print(f"  BIGGEST MTS DROPS  --  {len(dropped)} metric(s)")
+        print("=" * 120)
+        print(f"{'Rank':<5} {'Metric':<48} {'Baseline':>10} {'Current':>10} {'Delta':>10} {'Change':>8}  {'Source'}")
+        print("-" * 120)
+        for i, d in enumerate(dropped[:top_n], 1):
+            print(f"{i:<5} {d['metric']:<48} {d['mts1']:>10,} {d['mts2']:>10,} {d['delta']:>+10,} "
+                  f"{d['pct_change']:>7.1f}%  {d['source']}")
+        print()
+
+    if not increased and not new_metrics:
+        print(f"  No metrics exceeded the minimum delta of {min_delta:,} MTS.")
+        print(f"  Use --min-delta to lower the threshold.\n")
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -1839,6 +2077,25 @@ def main():
     # history
     p_history = sub.add_parser("history", help="Show scan history — total MTS and cost trend over time")
     p_history.add_argument("--limit", type=int, default=30, help="Number of past scans to show (default: 30)")
+
+    # compare
+    p_compare = sub.add_parser("compare", help=(
+        "Compare MTS counts between two dates to identify spike sources. "
+        "Use 'now' as either date for a live snapshot. "
+        "Falls back to stored scan history when available."
+    ))
+    p_compare.add_argument("--date1", required=True,
+                           help="Baseline date: 'YYYY-MM-DD', 'YYYY-MM-DDTHH:MM', or 'now'")
+    p_compare.add_argument("--date2", required=True,
+                           help="Comparison date: 'YYYY-MM-DD', 'YYYY-MM-DDTHH:MM', or 'now'")
+    p_compare.add_argument("--top", type=int, default=20,
+                           help="Show top N metrics per section (default: 20)")
+    p_compare.add_argument("--min-delta", type=int, default=100,
+                           help="Minimum MTS change to include in output (default: 100)")
+    p_compare.add_argument("--no-new", action="store_true",
+                           help="Hide the 'new metrics' section")
+    p_compare.add_argument("--show-dropped", action="store_true",
+                           help="Also show metrics that decreased most")
 
     args = parser.parse_args()
 
@@ -1913,6 +2170,16 @@ def main():
 
     elif args.command == "history":
         show_history(limit=args.limit)
+
+    elif args.command == "compare":
+        cmd_compare(
+            date1        = args.date1,
+            date2        = args.date2,
+            top_n        = args.top,
+            min_delta    = args.min_delta,
+            show_new     = not args.no_new,
+            show_dropped = args.show_dropped,
+        )
 
     elif args.command == "resolve":
         mts_list = fetch_mts_for_metric(args.metric, limit=100)

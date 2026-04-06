@@ -436,3 +436,73 @@ processors:
 ```
 
 Each processor is named `transform/drop_<dim>` or `transform/hash_<dim>` and scoped to only the affected metrics via `include.metric_names`, so it won't accidentally affect unrelated metrics that happen to share the same dimension name.
+
+## MTS spike comparison
+
+Compare MTS counts between any two points in time to identify what caused a cardinality spike and which service/token is responsible.
+
+```bash
+# Compare stored April 1 snapshot vs live data now
+python3 cardinality_governance.py compare --date1 2026-04-01 --date2 now
+
+# Compare two stored scan dates
+python3 cardinality_governance.py compare --date1 2026-03-20 --date2 2026-04-01
+
+# Lower threshold to catch smaller changes; also show drops
+python3 cardinality_governance.py compare --date1 2026-04-01 --date2 now \
+  --min-delta 10 --show-dropped
+
+# Focus on top 10 biggest movers
+python3 cardinality_governance.py compare --date1 2026-04-01 --date2 now --top 10 --no-new
+```
+
+**Output sections:**
+
+| Section | What it shows |
+|---|---|
+| Summary header | Total MTS baseline → compared, net delta, monthly cost impact |
+| Top MTS Increases | Metrics that grew by ≥ `--min-delta` MTS, sorted by delta |
+| Source breakdown | Aggregates increases by instrumentation source (OTel SDK, OTel Collector, Kubernetes, etc.) |
+| Token breakdown | Aggregates increases by ingest token — pinpoints which pipeline/team drove the spike |
+| New Metrics | Metrics that appear in the compared snapshot but not the baseline |
+| Biggest Drops | (with `--show-dropped`) Metrics that shrank most |
+
+**How dates work:**
+- `now` — fetches a live snapshot from the API (takes ~2-5 minutes for large orgs)
+- `YYYY-MM-DD` or `YYYY-MM-DDTHH:MM` — looks up the stored scan closest to that date/time
+- If no stored scan is available near the given date, falls back to a live API fetch
+
+**Tip:** Run `scan` regularly (e.g. daily via cron) to build up history, then use `compare` to instantly diff any two stored dates without re-fetching data.
+
+**Example output:**
+```
+MTS Spike Comparison  (realm=us1)  generated 2026-04-06 16:29 UTC
+
+  Baseline  (2026-04-05T04:29):       4,283 MTS   ~$8.57/mo
+  Compared  (2026-04-06T16:29):       8,493 MTS   ~$16.99/mo
+  Net change:               +    4,210 MTS  (+98.3%)   ~$8.42/mo added
+
+========================================================================================================================
+  TOP MTS INCREASES  (>=100 MTS delta)  --  12 metric(s)
+========================================================================================================================
+Rank  Metric                                             Baseline    Current      Delta   Change  Source                    Services / Token
+1     http.server.request.duration_bucket                     120         480       +360   +200.0%  OTel SDK (app)            api-gateway, customers-service [petclinic-INGEST]
+2     http.client.request.duration_bucket                      80         320       +240   +200.0%  OTel SDK (app)            visits-service [petclinic-INGEST]
+...
+
+  Source breakdown for increased metrics:
+  Source                         Metrics    MTS Added     Cost Added
+  OTel SDK (app)                      8        2,840      ~$5.68/mo
+  OTel Collector                      3          890      ~$1.78/mo
+
+  Token breakdown for increased metrics:
+  Token                              Metrics    MTS Added
+  petclinic-INGEST                        8        2,840
+  petclinicmcptest-INGEST                 3          890
+
+========================================================================================================================
+  NEW METRICS  (first seen in compared snapshot)  --  5 metric(s)
+========================================================================================================================
+Rank  Metric                                                  MTS  Source                    Services / Token
+1     otelcol_k8s_pod_association                              65  OTel Collector            otel-agent
+```
