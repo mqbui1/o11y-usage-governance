@@ -1098,6 +1098,93 @@ def watch_mode(interval=300, threshold=HIGH_MTS_COUNT):
 # Rollup suggestion
 # ---------------------------------------------------------------------------
 
+def drilldown_dimension(dimension_name, top_n=50):
+    """
+    Show every metric in the org that carries a given dimension,
+    ranked by unique value count — full blast radius before applying a fix.
+    """
+    print(f"\nDimension drill-down: `{dimension_name}` (realm={REALM})\n")
+    print("  Fetching metric catalog...")
+    metrics = fetch_metrics()
+    print(f"  Scanning {len(metrics)} metrics for dimension `{dimension_name}`...\n")
+
+    hits = []
+    for i, metric in enumerate(metrics):
+        name = metric.get("name", "")
+        mts_list = fetch_mts_for_metric(name, limit=500)
+        if not mts_list:
+            continue
+
+        # Check if this dimension exists in the sampled MTS
+        values = set()
+        for mts in mts_list:
+            v = mts.get("dimensions", {}).get(dimension_name)
+            if v is not None:
+                values.add(str(v))
+
+        if not values:
+            continue
+
+        pattern = None
+        for v in list(values)[:5]:
+            p = detect_cardinality_pattern(v)
+            if p:
+                pattern = p
+                break
+
+        instr_source, _ = infer_instrumentation_source(name, mts_list)
+        mts_count = len(mts_list)
+        attribution = attribute_detail(mts_list)
+
+        hits.append({
+            "metric":       name,
+            "mts_count":    mts_count,
+            "unique_values": len(values),
+            "sample_values": sorted(values)[:5],
+            "pattern":      pattern,
+            "instr_source": instr_source,
+            "services":     attribution["services"],
+        })
+
+    if not hits:
+        print(f"  No metrics found carrying dimension `{dimension_name}`.")
+        return
+
+    hits.sort(key=lambda x: -x["unique_values"])
+    total_mts     = sum(h["mts_count"] for h in hits)
+    total_cost    = total_mts * MTS_COST_PER_MONTH
+    max_unique    = max(h["unique_values"] for h in hits)
+
+    print(f"  Found {len(hits)} metric(s) carrying `{dimension_name}`")
+    print(f"  Combined MTS: {total_mts:,}  |  Est. cost: ~${total_cost:,.2f}/mo")
+    print(f"  Max unique values seen: {max_unique:,}")
+    if hits[0].get("pattern"):
+        print(f"  Anti-pattern detected: {hits[0]['pattern']}")
+    print()
+
+    # Print ranked table
+    print(f"{'Rank':<5} {'Metric':<50} {'MTS':>7} {'Unique Values':>13} {'Pattern':<18} {'Source':<25} Services")
+    print("-" * 140)
+    for i, h in enumerate(hits[:top_n], 1):
+        pattern_str  = h["pattern"] or "—"
+        services_str = ", ".join(h["services"][:2])
+        print(f"{i:<5} {h['metric']:<50} {h['mts_count']:>7,} {h['unique_values']:>13,} {pattern_str:<18} {h['instr_source']:<25} {services_str}")
+
+    print()
+    # Generate the fix YAML for this dimension across all affected metrics
+    all_metric_names = [h["metric"] for h in hits]
+    dim_info = {"unique_values": max_unique, "pattern": hits[0].get("pattern")}
+    fix = generate_fix_yaml(dimension_name, all_metric_names, dim_info)
+
+    print("=" * 70)
+    print(f"FIX: Drop `{dimension_name}` from all {len(hits)} affected metrics")
+    print("=" * 70)
+    print(fix["filter_processor"])
+    print()
+    print("--- Alternative: hash instead of drop ---")
+    print(fix["transform_processor"])
+
+
 def suggest_rollup(metric_name):
     """Generate a SignalFlow rollup suggestion for a specific metric."""
     mts_list = fetch_mts_for_metric(metric_name, limit=10000)
@@ -1175,6 +1262,11 @@ def main():
     p_resolve.add_argument("--metric", required=True, help="Metric name to mark resolved")
     p_resolve.add_argument("--note", default="", help="Optional note (e.g. 'applied delete_key fix in collector v1.2')")
 
+    # drilldown
+    p_drill = sub.add_parser("drilldown", help="Show all metrics carrying a given dimension — full blast radius before applying a fix")
+    p_drill.add_argument("--dimension", required=True, help="Dimension name to drill down on (e.g. server.address)")
+    p_drill.add_argument("--top", type=int, default=50, help="Show top N metrics (default: 50)")
+
     args = parser.parse_args()
 
     if not TOKEN:
@@ -1212,6 +1304,9 @@ def main():
 
     elif args.command == "rollup":
         suggest_rollup(args.metric)
+
+    elif args.command == "drilldown":
+        drilldown_dimension(args.dimension, top_n=args.top)
 
     elif args.command == "resolve":
         mts_list = fetch_mts_for_metric(args.metric, limit=100)
