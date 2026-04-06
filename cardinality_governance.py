@@ -60,6 +60,8 @@ REPORTS_DIR  = Path("reports")
 STATE_DB     = Path("cardinality_state.db")
 TREND_GROWTH_WARN    = 0.20   # flag if MTS grew >20% since last scan
 REMEDIATION_DROP_PCT = 0.50   # mark resolved if MTS dropped >50% vs peak
+ANOMALY_RATIO        = float(os.environ.get("ANOMALY_RATIO", "2.0"))  # flag if current MTS > N× 7-day avg
+ANOMALY_MIN_SAMPLES  = int(os.environ.get("ANOMALY_MIN_SAMPLES", "3"))  # need at least this many history points
 
 # Cost estimation — override with MTS_COST_PER_MONTH env var
 # Default: $0.002 per MTS per month (conservative mid-tier estimate)
@@ -288,6 +290,28 @@ def db_get_resolved():
     ).fetchall()
     conn.close()
     return rows
+
+
+def db_get_7day_avg(metric_name, days=7):
+    """
+    Return the average MTS count for a metric over the last N days of scan history.
+    Returns (avg, num_samples) or (None, 0) if insufficient history.
+    """
+    if not STATE_DB.exists():
+        return None, 0
+    conn = db_connect()
+    rows = conn.execute(
+        """SELECT mts_count FROM scans
+           WHERE realm=? AND metric=?
+             AND scanned_at >= datetime('now', ?)
+           ORDER BY scanned_at DESC""",
+        (REALM, metric_name, f"-{days} days")
+    ).fetchall()
+    conn.close()
+    if not rows:
+        return None, 0
+    values = [r[0] for r in rows]
+    return sum(values) / len(values), len(values)
 
 
 def db_is_resolved(metric_name):
@@ -738,6 +762,15 @@ def scan_org(top_n=50, verbose=False):
             prev_ts    = None
             trend      = "NEW"
 
+        # Anomaly detection: flag metrics growing faster than their own 7-day baseline
+        baseline_avg, baseline_samples = db_get_7day_avg(name)
+        anomaly = False
+        baseline_ratio = None
+        if baseline_avg and baseline_avg > 0 and baseline_samples >= ANOMALY_MIN_SAMPLES:
+            baseline_ratio = round(mts_count / baseline_avg, 2)
+            if baseline_ratio >= ANOMALY_RATIO:
+                anomaly = True
+
         # Auto-remediation detection: check if MTS dropped >50% vs historical peak
         peak_mts, peak_at = db_get_peak(name)
         auto_resolved = False
@@ -786,6 +819,9 @@ def scan_org(top_n=50, verbose=False):
             "auto_resolved":  auto_resolved,
             "peak_mts":       peak_mts,
             "peak_at":        peak_at,
+            "anomaly":        anomaly,
+            "baseline_ratio": baseline_ratio,
+            "baseline_samples": baseline_samples if baseline_avg else 0,
         })
 
     # Sort by MTS count descending
@@ -2404,6 +2440,364 @@ def cmd_compare_traces(date1, date2, environment=None, top_n=20, min_delta=50,
         print(f"  No services exceeded the minimum span delta of {min_delta}.")
         print(f"  Use --min-delta to lower the threshold or check the environment name.\n")
 
+
+# ---------------------------------------------------------------------------
+# Unified usage-compare (metrics + traces)
+# ---------------------------------------------------------------------------
+
+def cmd_usage_compare(date1, date2, environment=None, top_n=20,
+                      metric_min_delta=100, trace_min_delta=10,
+                      lookback_hours=1.0, show_dropped=False):
+    """
+    Unified post-incident comparison: runs metric MTS diff and trace span diff
+    side-by-side, then prints a combined signal summary.
+    """
+    now_str   = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    env_label = environment or "(all environments)"
+    width     = 120
+
+    print()
+    print("=" * width)
+    print(f"  USAGE COMPARE  |  realm={REALM}  |  env={env_label}  |  {now_str}")
+    print(f"  Baseline: {date1}   vs   Compared: {date2}")
+    print("=" * width)
+
+    # ── Metrics section ───────────────────────────────────────────────────
+    print()
+    print(f"  [METRICS]  MTS cardinality comparison")
+    print("-" * width)
+
+    now_ms   = int(time.time() * 1000)
+    LIVE     = "now"
+
+    def load_metric_snap(date_str, label):
+        if date_str.lower() == LIVE:
+            print(f"  Fetching live metric snapshot for {label}...")
+            snap = fetch_live_snapshot(verbose=False)
+            ts   = datetime.now(timezone.utc).isoformat()
+            print(f"  Live metric snapshot: {len(snap):,} metrics")
+            return snap, ts
+        else:
+            snap, ts = db_get_snapshot_near_date(date_str)
+            if snap:
+                print(f"  Metric snapshot for {label}: {len(snap):,} metrics from {ts[:16]}")
+            else:
+                print(f"  No stored metric snapshot near '{date_str}' — fetching live...")
+                snap = fetch_live_snapshot(verbose=False)
+                ts   = datetime.now(timezone.utc).isoformat()
+                print(f"  Live metric snapshot: {len(snap):,} metrics")
+            return snap, ts
+
+    msnap1, mts1 = load_metric_snap(date1, "baseline")
+    msnap2, mts2 = load_metric_snap(date2, "compared")
+
+    metric_deltas = compare_snapshots(msnap1, msnap2) if (msnap1 or msnap2) else []
+    m_increased   = sorted([d for d in metric_deltas if d["delta"] >= metric_min_delta],
+                           key=lambda x: -x["delta"])
+    m_new         = [d for d in metric_deltas if d["mts1"] == 0 and d["mts2"] > 0]
+    m_total1      = sum(d["mts1"] for d in metric_deltas)
+    m_total2      = sum(d["mts2"] for d in metric_deltas)
+    m_net         = m_total2 - m_total1
+    m_pct         = round(m_net / m_total1 * 100, 1) if m_total1 > 0 else 0.0
+
+    print()
+    arrow = "+" if m_net >= 0 else "-"
+    print(f"  Baseline  ({mts1[:16]}):  {m_total1:>10,} MTS   {estimate_cost(m_total1)}")
+    print(f"  Compared  ({mts2[:16]}):  {m_total2:>10,} MTS   {estimate_cost(m_total2)}")
+    print(f"  Net:                        {arrow}{abs(m_net):>9,} MTS  ({m_pct:+.1f}%)   "
+          f"{estimate_cost(abs(m_net))} {'added' if m_net >= 0 else 'saved'}")
+    print()
+
+    if m_increased:
+        print(f"  Top metric increases (>={metric_min_delta} MTS delta):")
+        print(f"  {'Metric':<50} {'Baseline':>10} {'Current':>10} {'Delta':>10} {'Change':>8}  {'Source':<25} {'Token'}")
+        print("  " + "-" * 118)
+        for d in m_increased[:top_n]:
+            pct_str  = f"+{d['pct_change']:.1f}%" if d["mts1"] > 0 else "NEW"
+            base_str = f"{d['mts1']:,}" if d["mts1"] > 0 else "--"
+            print(f"  {d['metric']:<50} {base_str:>10} {d['mts2']:>10,} {d['delta']:>+10,} "
+                  f"{pct_str:>8}  {d['source']:<25} {d['token'] or '--'}")
+        print()
+
+        # Source breakdown
+        by_src = defaultdict(lambda: {"metrics": 0, "delta": 0})
+        for d in m_increased:
+            by_src[d["source"]]["metrics"] += 1
+            by_src[d["source"]]["delta"]   += d["delta"]
+        print(f"  Metric source breakdown:")
+        for src, info in sorted(by_src.items(), key=lambda x: -x[1]["delta"]):
+            print(f"    {src:<30} {info['metrics']:>4} metrics   {info['delta']:>8,} MTS   {estimate_cost(info['delta'])}")
+        print()
+    elif msnap1 or msnap2:
+        print(f"  No metric changes >= {metric_min_delta} MTS delta.\n")
+
+    if m_new:
+        print(f"  New metrics ({len(m_new)}): " +
+              ", ".join(d["metric"] for d in sorted(m_new, key=lambda x: -x["mts2"])[:5]) +
+              ("..." if len(m_new) > 5 else ""))
+        print()
+
+    # ── Traces section ────────────────────────────────────────────────────
+    print("-" * width)
+    print(f"  [TRACES]  APM span volume comparison  (env={env_label})")
+    print("-" * width)
+    print()
+
+    window_ms = int(lookback_hours * 3600 * 1000)
+
+    def load_trace_snap(date_str, label):
+        if date_str.lower() == LIVE:
+            print(f"  Fetching live trace snapshot for {label} (last {lookback_hours}h)...")
+            snap, meta = fetch_trace_snapshot(now_ms - window_ms, now_ms, environment=environment)
+            ts = datetime.now(timezone.utc).isoformat()
+            print(f"  Live trace snapshot: {meta['sample_size']} traces, {len(snap)} services")
+            if snap:
+                db_save_trace_summary(ts, environment or "", snap)
+            return snap, ts
+        else:
+            snap, ts = db_get_trace_snapshot_near_date(date_str, environment=environment)
+            if snap:
+                print(f"  Trace snapshot for {label}: {len(snap)} services from {ts[:16]}")
+            else:
+                print(f"  No stored trace snapshot near '{date_str}' — fetching live...")
+                snap, meta = fetch_trace_snapshot(now_ms - window_ms, now_ms, environment=environment)
+                ts = datetime.now(timezone.utc).isoformat()
+                print(f"  Live trace snapshot: {meta['sample_size']} traces, {len(snap)} services")
+                if snap:
+                    db_save_trace_summary(ts, environment or "", snap)
+            return snap, ts
+
+    tsnap1, tts1 = load_trace_snap(date1, "baseline")
+    tsnap2, tts2 = load_trace_snap(date2, "compared")
+
+    # Build trace deltas
+    t_deltas = []
+    for svc in set(tsnap1) | set(tsnap2):
+        s1 = tsnap1.get(svc, {"span_count": 0, "error_rate": 0.0})
+        s2 = tsnap2.get(svc, {"span_count": 0, "error_rate": 0.0})
+        delta = s2["span_count"] - s1["span_count"]
+        pct   = round(delta / s1["span_count"] * 100, 1) if s1["span_count"] > 0 else (100.0 if s2["span_count"] > 0 else 0.0)
+        t_deltas.append({
+            "service":    svc,
+            "spans1":     s1["span_count"],
+            "spans2":     s2["span_count"],
+            "delta":      delta,
+            "pct":        pct,
+            "err1":       s1["error_rate"] * 100,
+            "err2":       s2["error_rate"] * 100,
+            "err_delta":  round(s2["error_rate"] * 100 - s1["error_rate"] * 100, 2),
+        })
+
+    t_increased = sorted([d for d in t_deltas if d["delta"] >= trace_min_delta],
+                         key=lambda x: -x["delta"])
+    t_new       = [d for d in t_deltas if d["spans1"] == 0 and d["spans2"] > 0]
+    t_total1    = sum(d["spans1"] for d in t_deltas)
+    t_total2    = sum(d["spans2"] for d in t_deltas)
+    t_net       = t_total2 - t_total1
+    t_pct       = round(t_net / t_total1 * 100, 1) if t_total1 > 0 else 0.0
+
+    print()
+    tarrow = "+" if t_net >= 0 else "-"
+    print(f"  Baseline  ({tts1[:16]}):  {t_total1:>8,} spans sampled")
+    print(f"  Compared  ({tts2[:16]}):  {t_total2:>8,} spans sampled")
+    print(f"  Net:                      {tarrow}{abs(t_net):>7,} spans  ({t_pct:+.1f}%)")
+    print()
+
+    if t_increased:
+        print(f"  Top span increases (>={trace_min_delta} delta):")
+        print(f"  {'Service':<35} {'Baseline':>9} {'Current':>9} {'Delta':>9} {'Change':>8}  {'ErrRate Now':>12}  {'Err Delta':>10}")
+        print("  " + "-" * 100)
+        for d in t_increased[:top_n]:
+            pct_str  = f"+{d['pct']:.1f}%" if d["spans1"] > 0 else "NEW"
+            base_str = f"{d['spans1']:,}" if d["spans1"] > 0 else "--"
+            err_str  = f"{d['err_delta']:+.1f}pp" if d["err_delta"] != 0 else "--"
+            print(f"  {d['service']:<35} {base_str:>9} {d['spans2']:>9,} {d['delta']:>+9,} "
+                  f"{pct_str:>8}  {d['err2']:>10.1f}%  {err_str:>10}")
+        print()
+    elif tsnap1 or tsnap2:
+        print(f"  No trace changes >= {trace_min_delta} span delta.\n")
+
+    if t_new:
+        print(f"  New services ({len(t_new)}): " +
+              ", ".join(d["service"] for d in sorted(t_new, key=lambda x: -x["spans2"])[:5]) +
+              ("..." if len(t_new) > 5 else ""))
+        print()
+
+    # ── Combined signal summary ───────────────────────────────────────────
+    print("=" * width)
+    print("  SIGNAL SUMMARY")
+    print("=" * width)
+
+    has_metric_spike = bool(m_increased or m_new)
+    has_trace_spike  = bool(t_increased or t_new)
+
+    if has_metric_spike and has_trace_spike:
+        # Find services that appear in both
+        metric_services = set()
+        for d in m_increased:
+            metric_services.update(d.get("services", []))
+        trace_services = {d["service"] for d in t_increased + t_new}
+        overlap = metric_services & trace_services
+        print()
+        print(f"  Both MTS and span volumes changed — likely a deployment or configuration change.")
+        if overlap:
+            print(f"  Services implicated in BOTH signals: {', '.join(sorted(overlap))}")
+            print(f"  These are the highest-priority services to investigate.")
+        print()
+        print(f"  Metric change:  {m_net:+,} MTS  ({m_pct:+.1f}%)   {estimate_cost(abs(m_net))} {'added' if m_net >= 0 else 'saved'}")
+        print(f"  Trace change:   {t_net:+,} spans sampled  ({t_pct:+.1f}%)")
+    elif has_metric_spike and not has_trace_spike:
+        print()
+        print(f"  Only metric MTS changed — trace volume is stable.")
+        print(f"  Likely cause: new dimensions or higher-cardinality labels introduced to an existing metric.")
+        print(f"  Metric change: {m_net:+,} MTS  ({m_pct:+.1f}%)   {estimate_cost(abs(m_net))} {'added' if m_net >= 0 else 'saved'}")
+    elif has_trace_spike and not has_metric_spike:
+        print()
+        print(f"  Only trace span volume changed — metric cardinality is stable.")
+        print(f"  Likely cause: a service started generating more requests/operations, or sampling rate changed.")
+        print(f"  Trace change:  {t_net:+,} spans sampled  ({t_pct:+.1f}%)")
+    else:
+        print()
+        print(f"  No significant changes found above the configured thresholds.")
+        print(f"  Metric threshold: {metric_min_delta} MTS  |  Trace threshold: {trace_min_delta} spans")
+    print()
+
+
+# ---------------------------------------------------------------------------
+# Anomaly detection scan (baseline-relative)
+# ---------------------------------------------------------------------------
+
+def db_get_all_metrics_with_history(days=7, min_samples=3):
+    """
+    Return list of (metric, current_mts, avg_mts, num_samples) for metrics
+    that have at least min_samples scan points within the last `days` days.
+    current_mts = the most recent scan value.
+    avg_mts     = average over the window (excluding the most recent point).
+    """
+    if not STATE_DB.exists():
+        return []
+    conn = db_connect()
+
+    # For each metric: get all readings in the last N days
+    rows = conn.execute(
+        """SELECT metric, mts_count, scanned_at
+           FROM scans
+           WHERE realm=? AND scanned_at >= datetime('now', ?)
+           ORDER BY metric, scanned_at DESC""",
+        (REALM, f"-{days} days")
+    ).fetchall()
+    conn.close()
+
+    from collections import OrderedDict
+    by_metric = OrderedDict()
+    for metric, mts, ts in rows:
+        if metric not in by_metric:
+            by_metric[metric] = []
+        by_metric[metric].append((ts, mts))
+
+    result = []
+    for metric, readings in by_metric.items():
+        if len(readings) < min_samples:
+            continue
+        # Most recent reading is current; rest form the baseline
+        current_mts = readings[0][1]
+        baseline_vals = [r[1] for r in readings[1:]]
+        if not baseline_vals:
+            continue
+        avg = sum(baseline_vals) / len(baseline_vals)
+        result.append((metric, current_mts, avg, len(readings)))
+
+    return result
+
+
+def cmd_anomaly_scan(top_n=20, ratio=None, days=7, min_samples=None):
+    """
+    Scan for metrics that are growing faster than their own historical baseline.
+    Catches slow-burn explosions that haven't crossed static CRITICAL/HIGH thresholds yet.
+    """
+    if ratio is None:
+        ratio = ANOMALY_RATIO
+    if min_samples is None:
+        min_samples = ANOMALY_MIN_SAMPLES
+
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    print(f"\nAnomaly Scan  (realm={REALM})  generated {now_str}")
+    print(f"  Threshold: current MTS >= {ratio}x {days}-day average  |  min history points: {min_samples}\n")
+
+    if not STATE_DB.exists():
+        print("  No scan history found. Run 'scan' at least a few times to build a baseline.")
+        return
+
+    all_data = db_get_all_metrics_with_history(days=days, min_samples=min_samples)
+    if not all_data:
+        print(f"  No metrics have {min_samples}+ scan points in the last {days} days.")
+        print(f"  Run 'scan' regularly (daily cron recommended) to build history.")
+        return
+
+    anomalies = []
+    for metric, current, avg, samples in all_data:
+        if avg <= 0:
+            continue
+        r = current / avg
+        if r >= ratio:
+            sev = severity(current)
+            anomalies.append({
+                "metric":   metric,
+                "current":  current,
+                "avg":      avg,
+                "ratio":    round(r, 2),
+                "samples":  samples,
+                "severity": sev,
+            })
+
+    # Also find metrics currently below static thresholds but anomalous
+    static_only  = [a for a in anomalies if a["severity"] == "LOW"]
+    already_flagged = [a for a in anomalies if a["severity"] != "LOW"]
+
+    anomalies.sort(key=lambda x: -x["ratio"])
+
+    if not anomalies:
+        print(f"  No anomalies detected across {len(all_data)} metrics with sufficient history.")
+        print(f"  All metrics are within {ratio}x of their {days}-day average.")
+        return
+
+    print(f"  Checked {len(all_data)} metrics with {min_samples}+ history points.")
+    print(f"  Found {len(anomalies)} anomaly/anomalies  "
+          f"({len(already_flagged)} already above static thresholds, "
+          f"{len(static_only)} below thresholds but growing abnormally)\n")
+
+    # ── Anomalies below static thresholds (the real value-add) ────────────
+    if static_only:
+        print(f"  BELOW-THRESHOLD ANOMALIES  —  growing fast but not yet CRITICAL/HIGH")
+        print(f"  These would be MISSED by a static threshold scan.")
+        print(f"  {'Metric':<52} {'Current':>8} {'7d Avg':>8} {'Ratio':>7} {'Samples':>8} {'Severity'}")
+        print("  " + "-" * 100)
+        for a in sorted(static_only, key=lambda x: -x["ratio"])[:top_n]:
+            sev_icon = {"CRITICAL": "[CRIT]", "HIGH": "[HIGH]", "MEDIUM": "[MED]"}.get(a["severity"], "[LOW]")
+            print(f"  {a['metric']:<52} {a['current']:>8,} {a['avg']:>8,.0f} {a['ratio']:>6.1f}x "
+                  f"{a['samples']:>8}  {sev_icon}")
+        print()
+
+    # ── Anomalies that are also above static thresholds ───────────────────
+    if already_flagged:
+        print(f"  ABOVE-THRESHOLD ANOMALIES  —  flagged by static scan AND growing abnormally fast")
+        print(f"  {'Metric':<52} {'Current':>8} {'7d Avg':>8} {'Ratio':>7} {'Samples':>8} {'Severity'}")
+        print("  " + "-" * 100)
+        for a in sorted(already_flagged, key=lambda x: -x["ratio"])[:top_n]:
+            sev_icon = {"CRITICAL": "[CRIT]", "HIGH": "[HIGH]", "MEDIUM": "[MED]"}.get(a["severity"], "[LOW]")
+            print(f"  {a['metric']:<52} {a['current']:>8,} {a['avg']:>8,.0f} {a['ratio']:>6.1f}x "
+                  f"{a['samples']:>8}  {sev_icon}")
+        print()
+
+    # ── Summary ───────────────────────────────────────────────────────────
+    if static_only:
+        top_hidden = static_only[0]
+        print(f"  Top hidden anomaly: '{top_hidden['metric']}'")
+        print(f"    Current MTS: {top_hidden['current']:,}  |  7-day avg: {top_hidden['avg']:,.0f}  |  "
+              f"Ratio: {top_hidden['ratio']}x  |  {estimate_cost(top_hidden['current'])}/mo")
+        print(f"    Run: python3 cardinality_governance.py rollup --metric \"{top_hidden['metric']}\"")
+    print()
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -2510,6 +2904,42 @@ def main():
     p_tcompare.add_argument("--show-dropped", action="store_true",
                             help="Also show services with biggest span decreases")
 
+    # usage-compare
+    p_ucompare = sub.add_parser("usage-compare", help=(
+        "Unified comparison — runs both metric MTS and trace span comparisons together. "
+        "Useful for post-incident reviews to see the full picture across both signals."
+    ))
+    p_ucompare.add_argument("--date1", required=True,
+                            help="Baseline: 'YYYY-MM-DD', 'YYYY-MM-DDTHH:MM', or 'now'")
+    p_ucompare.add_argument("--date2", required=True,
+                            help="Comparison: 'YYYY-MM-DD', 'YYYY-MM-DDTHH:MM', or 'now'")
+    p_ucompare.add_argument("--environment", "-e", default=None,
+                            help="APM environment for trace comparison (recommended)")
+    p_ucompare.add_argument("--top", type=int, default=20,
+                            help="Max rows per section (default: 20)")
+    p_ucompare.add_argument("--metric-min-delta", type=int, default=100,
+                            help="Minimum MTS delta for metric section (default: 100)")
+    p_ucompare.add_argument("--trace-min-delta", type=int, default=10,
+                            help="Minimum span delta for trace section (default: 10)")
+    p_ucompare.add_argument("--lookback", type=float, default=1.0,
+                            help="Hours per window for live trace snapshots (default: 1)")
+    p_ucompare.add_argument("--show-dropped", action="store_true",
+                            help="Show metrics/services that decreased most")
+
+    # anomaly-scan
+    p_ascan = sub.add_parser("anomaly-scan", help=(
+        "Scan for metrics growing faster than their own 7-day historical baseline. "
+        "Catches slow-burn cardinality explosions that haven't crossed static thresholds yet."
+    ))
+    p_ascan.add_argument("--top", type=int, default=20,
+                         help="Show top N anomalies (default: 20)")
+    p_ascan.add_argument("--ratio", type=float, default=ANOMALY_RATIO,
+                         help=f"Flag if current MTS exceeds N times 7-day avg (default: {ANOMALY_RATIO})")
+    p_ascan.add_argument("--days", type=int, default=7,
+                         help="Baseline window in days (default: 7)")
+    p_ascan.add_argument("--min-samples", type=int, default=ANOMALY_MIN_SAMPLES,
+                         help=f"Minimum history points required (default: {ANOMALY_MIN_SAMPLES})")
+
     args = parser.parse_args()
 
     if not TOKEN:
@@ -2530,8 +2960,9 @@ def main():
             trend_str  = f"{trend_icon}{f.get('trend','')}"
             if f.get("growth_pct") and f.get("trend") == "GROWING":
                 trend_str += f"(+{int(f['growth_pct']*100)}%)"
+            anomaly_tag = f" [ANOMALY {f['baseline_ratio']}x]" if f.get("anomaly") else ""
             worst = f"{f['worst_dim']} ({f['worst_dim_info']['unique_values']:,})" if f["worst_dim"] else "—"
-            print(f"{i:<5} {f['metric']:<45} {f['mts_count']:>8,} {trend_str:<14} {sev_icon+f['severity']:<14} {f['instr_source']:<28} {worst}")
+            print(f"{i:<5} {f['metric']:<45} {f['mts_count']:>8,} {trend_str:<14} {sev_icon+f['severity']:<14} {f['instr_source']:<28} {worst}{anomaly_tag}")
 
     elif args.command == "report":
         findings = scan_org(top_n=args.top)
@@ -2629,6 +3060,26 @@ def main():
             show_new       = not args.no_new,
             show_dropped   = args.show_dropped,
             lookback_hours = args.lookback,
+        )
+
+    elif args.command == "usage-compare":
+        cmd_usage_compare(
+            date1             = args.date1,
+            date2             = args.date2,
+            environment       = args.environment,
+            top_n             = args.top,
+            metric_min_delta  = args.metric_min_delta,
+            trace_min_delta   = args.trace_min_delta,
+            lookback_hours    = args.lookback,
+            show_dropped      = args.show_dropped,
+        )
+
+    elif args.command == "anomaly-scan":
+        cmd_anomaly_scan(
+            top_n       = args.top,
+            ratio       = args.ratio,
+            days        = args.days,
+            min_samples = args.min_samples,
         )
 
     else:
