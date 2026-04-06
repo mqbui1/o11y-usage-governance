@@ -1,417 +1,285 @@
-# Metric Cardinality Governance
+# o11y-usage-governance
 
-Scans a Splunk Observability Cloud org for MTS (Metric Time Series) cardinality explosions, attributes them to teams and services, identifies the instrumentation source, tracks trends over time, and uses Claude (AWS Bedrock) to generate specific remediation recommendations.
+Observability usage governance for Splunk Observability Cloud. Identifies the source of metric cardinality explosions and trace volume spikes, attributes cost to services and teams, and generates ready-to-apply fixes.
+
+## What it covers
+
+| Signal | Problem it solves |
+|--------|-------------------|
+| **Metrics (MTS)** | Cardinality explosions — unbounded dimensions driving unexpected MTS growth and billing overages |
+| **Traces (APM)** | Span volume spikes — identifying which service suddenly started sending significantly more traces |
+
+Both can be compared between any two dates to quickly answer: _"what changed, and which service caused it?"_
 
 ## Why it matters
 
-High-cardinality metrics are the #1 cause of surprise overage bills in Splunk Observability Cloud. A single metric with an unbounded dimension (UUID, IP address, user ID, request ID) can generate millions of MTS without the team responsible ever knowing. This tool provides continuous visibility and actionable fixes.
+- A single metric with an unbounded dimension (UUID, IP address, user ID) can silently generate millions of MTS
+- A misconfigured or newly deployed service can double an org's trace ingest overnight
+- Neither problem is visible without tooling — this closes that gap with continuous scanning, trend tracking, and cost attribution
 
-**Common culprits:**
-- Pod IP addresses as metric dimensions in Kubernetes
-- UUIDs or trace IDs embedded in metric labels
-- High-cardinality HTTP routes or user identifiers
-- Histogram bucket metrics (`_bucket`) with unbounded label combinations
-
-## How it works
-
-1. **Paginated catalog scan** — fetches the complete metric catalog (no cap), iterates every metric
-2. **MTS analysis** — counts MTS per metric, samples dimension values to detect anti-patterns
-3. **Instrumentation source detection** — identifies whether the metric comes from OTel Collector, OTel SDK, JVM, Kubernetes, AWS, MySQL, etc.
-4. **Team attribution** — maps metrics to services/teams via `service.name`, `team`, and `owner` dimensions
-5. **Trend tracking** — compares current MTS count to previous scan (stored in SQLite), flags GROWING/FALLING/NEW/STABLE
-6. **Org limit awareness** — fetches org MTS limit and shows each finding's % contribution
-7. **Per-service scorecard** — ranks services/teams by total MTS contributed across all findings, showing ownership and % of total
-8. **Duplicate metric grouping** — identifies metrics sharing the same high-cardinality dimension and groups metric families (e.g. `_bucket/_count/_sum/_min/_max` variants) — one fix resolves the whole group
-9. **Fix suggestion generator** — for each duplicate group, auto-generates ready-to-paste OTel Collector `transform` processor YAML with the exact `delete_key()` statement and metric allow-list scoped to only the affected metrics; includes a collapsible SHA256-hash alternative
-10. **Remediation tracking** — automatically detects when a metric's MTS drops >50% vs its historical peak and marks it resolved; supports manual `resolve` command; resolved findings appear at the top of the next report confirming the fix worked
-11. **Cost estimation** — maps MTS count to estimated monthly cost (default `$0.002/MTS/mo`, configurable via `MTS_COST_PER_MONTH` env var); shown in report header, Top Offenders table, and per-service scorecard
-12. **Savings summary** — report header and Resolved Findings section show cumulative MTS and cost saved across all remediated metrics
-13. **Dimension drill-down** — `drilldown --dimension <name>` scans every metric in the org for that dimension, ranks by unique value count, shows combined MTS + cost, and generates a single fix YAML covering the full blast radius
-14. **False positive suppression** — `ignore <pattern>` excludes a metric name or glob (e.g. `sf.org.*`, `otelcol_*`) from all future scans and reports; `unignore` removes it; ignored count shown in report summary
-15. **Scan history** — `history` prints a table of past scans (total metrics, MTS, cost, severity counts) with a trend arrow showing whether the org is getting better or worse over time
-16. **HTML report** — `report --format html` generates a self-contained HTML file with sortable tables, tabbed layout, stat cards, alert banners, collapsible findings, and fix YAML — no external dependencies, shareable as a single file
-17. **AI remediation** — for CRITICAL and HIGH findings, calls Claude to generate specific OTel Collector processor configs, SignalFlow rollups, and estimated MTS reduction
-
-## Modes
-
-| Command | Description |
-|---------|-------------|
-| `scan` | Quick ranked table of top offenders with trend, source, and severity |
-| `report` | Full Markdown or HTML report saved to `reports/` with AI remediation for CRITICAL/HIGH |
-| `watch` | Continuous polling — emits Splunk custom events on new explosions and growth spikes |
-| `rollup` | Deep-dive on a single metric — dimension analysis + SignalFlow rollup + OTel processor config |
-| `resolve` | Manually mark a metric as remediated after applying a fix |
-| `drilldown` | Show every metric carrying a given dimension — full blast radius + combined fix YAML |
-| `ignore` | Exclude a metric name or glob pattern from future scans and reports |
-| `unignore` | Remove a pattern from the ignore list |
-| `ignored` | List all currently ignored patterns |
-| `history` | Show scan history — total MTS, cost, and severity trend over time |
+---
 
 ## Setup
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
+git clone https://github.com/mqbui1/o11y-usage-governance
+cd o11y-usage-governance
+
+python3 -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt
 
 export SPLUNK_ACCESS_TOKEN=<your-api-token>
-export SPLUNK_REALM=us1                          # us0, us1, us2, eu0, ap0, etc.
-export SPLUNK_INGEST_TOKEN=<your-ingest-token>   # optional — needed for watch mode events
-export AWS_DEFAULT_REGION=us-west-2              # needed for Claude AI remediation (Bedrock)
-export AWS_ACCESS_KEY_ID=<key>
-export AWS_SECRET_ACCESS_KEY=<secret>
-export AWS_SESSION_TOKEN=<token>                 # if using temporary credentials
+export SPLUNK_REALM=us1              # us0, us1, us2, eu0, ap0, etc.
+export SPLUNK_INGEST_TOKEN=<token>   # optional — needed for watch mode events only
 ```
 
-## Usage
+For AI remediation (optional — Claude via AWS Bedrock):
+```bash
+export AWS_DEFAULT_REGION=us-west-2
+export AWS_ACCESS_KEY_ID=<key>
+export AWS_SECRET_ACCESS_KEY=<secret>
+export AWS_SESSION_TOKEN=<token>     # if using temporary credentials
+```
+
+---
+
+## Commands
+
+### Metrics
+
+| Command | Description |
+|---------|-------------|
+| `scan` | Quick ranked table of top cardinality offenders |
+| `report` | Full Markdown or HTML report with AI remediation, saved to `reports/` |
+| `watch` | Continuous polling — emits Splunk events on new explosions |
+| `rollup` | Deep-dive on a single metric with SignalFlow rollup suggestions |
+| `compare` | Compare MTS counts between two dates — find what drove a spike |
+| `drilldown` | Full blast radius for a specific dimension across all metrics |
+| `resolve` | Manually mark a metric as remediated after applying a fix |
+| `ignore` | Exclude a metric or glob pattern from future scans |
+| `unignore` | Remove a pattern from the ignore list |
+| `ignored` | List all active ignore patterns |
+| `history` | Show scan history — total MTS, cost, severity trend over time |
+
+### Traces (APM)
+
+| Command | Description |
+|---------|-------------|
+| `trace-scan` | Snapshot current per-service span volumes and save to history |
+| `trace-compare` | Compare span volumes between two dates — identify which service spiked |
+
+---
+
+## Metrics: quick start
 
 ```bash
-# Quick scan — top 20 metrics ranked by MTS count
+# Scan the org — top 20 metrics ranked by MTS
 python3 cardinality_governance.py scan
 
 # Show all metrics including low severity
 python3 cardinality_governance.py scan --verbose
 
-# Show top 50 metrics
-python3 cardinality_governance.py scan --top 50
-
-# Full Markdown report with AI remediation (saved to reports/)
+# Full report with AI remediation (Markdown)
 python3 cardinality_governance.py report
 
-# Report without AI — faster, no Bedrock credentials needed
-python3 cardinality_governance.py report --no-ai
+# HTML report — self-contained, opens in browser
+python3 cardinality_governance.py report --format html --no-ai
 
-# HTML report — opens in browser automatically on macOS
-python3 cardinality_governance.py report --format html
+# Compare metric MTS between two dates
+python3 cardinality_governance.py compare --date1 2026-04-01 --date2 now
+python3 cardinality_governance.py compare --date1 2026-03-20 --date2 2026-04-01 --min-delta 50
 
-# Generate both Markdown and HTML
-python3 cardinality_governance.py report --format both --no-ai
-
-# Report for top 100 metrics
-python3 cardinality_governance.py report --top 100
-
-# Watch mode — poll every 5 minutes, emit Splunk events on explosions
-python3 cardinality_governance.py watch --interval 300
-
-# Watch mode with custom threshold
-python3 cardinality_governance.py watch --threshold 5000
-
-# Deep-dive rollup suggestion for a specific metric
-python3 cardinality_governance.py rollup --metric http.client.request.duration_bucket
-
-# Manually mark a metric as resolved after applying a fix
-python3 cardinality_governance.py resolve --metric http.client.request.duration_bucket
-python3 cardinality_governance.py resolve --metric http.client.request.duration_bucket --note "applied delete_key(server.address) in collector v1.2"
-
-# Dimension drill-down — full blast radius for a specific dimension
+# Full blast radius for a dimension before applying a fix
 python3 cardinality_governance.py drilldown --dimension server.address
-python3 cardinality_governance.py drilldown --dimension container.id --top 20
 
-# Ignore metrics you can't control (Splunk internals, collector telemetry)
-python3 cardinality_governance.py ignore "sf.org.*" --reason "Splunk internal — cannot remediate"
-python3 cardinality_governance.py ignore "otelcol_*" --reason "Collector internal telemetry"
-python3 cardinality_governance.py ignored          # list all ignored patterns
-python3 cardinality_governance.py unignore "sf.org.*"
+# Mark a metric resolved after deploying the fix
+python3 cardinality_governance.py resolve --metric http.client.request.duration_bucket \
+  --note "applied delete_key(server.address) in collector v1.2"
 
-# Scan history — trend over time
+# Suppress Splunk internals from reports
+python3 cardinality_governance.py ignore "sf.org.*" --reason "Splunk internal"
+python3 cardinality_governance.py ignore "otelcol_*" --reason "Collector telemetry"
+
+# Show scan history
 python3 cardinality_governance.py history
-python3 cardinality_governance.py history --limit 10
 ```
 
-## Scan output columns
+### `scan` output
 
 ```
-Rank  Metric                              MTS   Trend        Severity    Source               Worst Dimension
-1     http.client.request.duration_bucket  1,215 ➡️STABLE    🟠HIGH      HTTP Instrumentation  server.address (21 values)
-2     http.server.request.duration_bucket    810 📈GROWING+30% 🟡MEDIUM  HTTP Instrumentation  http.route (24 values)
+Rank  Metric                               MTS   Trend            Severity     Source                Worst Dimension
+1     http.client.request.duration_bucket  1,215 GROWING(+30%)    HIGH         HTTP Instrumentation  server.address (21 values)
+2     http.server.request.duration_bucket    810 STABLE           MEDIUM       HTTP Instrumentation  http.route (24 values)
 ```
 
 | Column | Description |
 |--------|-------------|
-| MTS | Total metric time series count for this metric |
-| Trend | Change since last scan: 📈 GROWING / 📉 FALLING / ➡️ STABLE / 🆕 NEW |
-| Severity | Based on MTS count thresholds |
+| MTS | Total metric time series for this metric |
+| Trend | Change vs last scan: GROWING / FALLING / STABLE / NEW |
+| Severity | CRITICAL (>=10k MTS) / HIGH (>=1k) / MEDIUM (>=500) |
 | Source | Inferred instrumentation origin |
-| Worst Dimension | Highest-cardinality dimension and its unique value count |
+| Worst Dimension | Highest-cardinality dimension and unique value count |
 
-## Severity thresholds
+### `compare` output
 
-| Severity | MTS Count | Meaning |
-|----------|-----------|---------|
-| 🔴 CRITICAL | ≥ 10,000 | Immediate action required — significant billing impact |
-| 🟠 HIGH | ≥ 1,000 | Investigate and plan remediation |
-| 🟡 MEDIUM | ≥ 500 | Monitor and address in next sprint |
+Compares metric MTS between two snapshots. Uses stored scan history when available; fetches live data for `now` or when no stored snapshot exists near the given date.
 
-## Instrumentation source detection
+```
+Baseline  (2026-04-01T08:00):       4,283 MTS   ~$8.57/mo
+Compared  (2026-04-06T16:29):       8,493 MTS   ~$16.99/mo
+Net change:               +    4,210 MTS  (+98.3%)   ~$8.42/mo added
 
-The tool automatically identifies where a metric is coming from based on its name prefix and dimensions:
+TOP MTS INCREASES  (>=100 MTS delta)  --  12 metric(s)
+Rank  Metric                                Baseline  Current    Delta   Change  Source           Services / Token
+1     http.server.request.duration_bucket        120      480     +360  +200.0%  OTel SDK (app)   api-gateway [petclinic-INGEST]
+2     http.client.request.duration_bucket         80      320     +240  +200.0%  OTel SDK (app)   visits-service [petclinic-INGEST]
+
+Source breakdown:
+  OTel SDK (app)       8 metrics    2,840 MTS added    ~$5.68/mo
+  OTel Collector       3 metrics      890 MTS added    ~$1.78/mo
+
+Token breakdown:
+  petclinic-INGEST     8 metrics    2,840 MTS added
+```
+
+`compare` options: `--date1`, `--date2` (required), `--top` (default 20), `--min-delta` (default 100), `--show-dropped`, `--no-new`
+
+**Tip:** Run `scan` on a schedule to build history, then `compare` diffs any two stored dates instantly without re-fetching.
+
+---
+
+## Traces: quick start
+
+```bash
+# Snapshot current per-service span volumes (saves to history)
+python3 cardinality_governance.py trace-scan --environment petclinicmbtest
+
+# Compare span volumes: stored date vs live
+python3 cardinality_governance.py trace-compare \
+  --date1 2026-04-01 --date2 now --environment petclinicmbtest
+
+# Compare two stored dates
+python3 cardinality_governance.py trace-compare \
+  --date1 2026-03-20 --date2 2026-04-01 --environment petclinicmbtest
+
+# Lower threshold; show services that dropped too
+python3 cardinality_governance.py trace-compare \
+  --date1 2026-04-01 --date2 now --environment petclinicmbtest \
+  --min-delta 5 --show-dropped
+```
+
+### `trace-scan` output
+
+```
+Trace Scan  (realm=us1)  env=petclinicmbtest  last 1.0h
+
+  Sample: 200 traces sampled over 1.0h
+
+  Service                    Spans   Traces   Errors    Err%
+  -----------------------------------------------------------
+  api-gateway                  221      187        0    0.0%
+  customers-service            211        1        0    0.0%
+  mysql:petclinic              137        0        0    0.0%
+  vets-service                  57        1        0    0.0%
+
+  Snapshot saved to cardinality_state.db at 2026-04-06T16:49
+```
+
+### `trace-compare` output
+
+```
+Trace Spike Comparison  (realm=us1)  env=petclinicmbtest
+
+  Baseline  (2026-04-01T08:00):   312 spans sampled
+  Compared  (2026-04-06T16:50):   673 spans sampled
+  Net change:               +   361 spans  (+115.7%)
+
+  TOP SPAN INCREASES  (>=10 span delta)  --  3 service(s)
+  Service               Baseline  Current    Delta   Change  ErrRate Baseline  ErrRate Now  Err Delta
+  api-gateway                 85      221     +136  +160.0%              0.0%         0.0%     +0.0pp
+  customers-service           63      211     +148  +234.9%              2.1%         0.0%     -2.1pp
+  mysql:petclinic             40      137      +97  +242.5%              0.0%         0.0%     +0.0pp
+```
+
+Span counts are from a 200-trace sample — relative changes between services are reliable; use deltas as indicators, not absolute volume.
+
+### `trace-compare` options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--date1` / `--date2` | required | `YYYY-MM-DD`, `YYYY-MM-DDTHH:MM`, or `now` |
+| `--environment` / `-e` | all | APM environment name — strongly recommended |
+| `--min-delta` | 10 | Minimum span delta to include |
+| `--top` | 20 | Max services per section |
+| `--lookback` | 1.0 | Hours per window for live snapshots |
+| `--show-dropped` | off | Show services with biggest span decreases |
+| `--no-new` | off | Hide new services section |
+
+**Tip:** Run `trace-scan` hourly via cron to build history:
+```cron
+0 * * * *  cd /path/to/o11y-usage-governance && \
+           SPLUNK_ACCESS_TOKEN=... \
+           python3 cardinality_governance.py trace-scan --environment myenv
+```
+
+---
+
+## Metrics: detailed feature reference
+
+### Severity thresholds
+
+| Severity | MTS count | Action |
+|----------|-----------|--------|
+| CRITICAL | >= 10,000 | Immediate — significant billing impact |
+| HIGH | >= 1,000 | Investigate and plan remediation |
+| MEDIUM | >= 500 | Monitor, address in next sprint |
+
+### Instrumentation source detection
+
+Automatically identified from metric name prefix and dimensions:
 
 | Source | Metric prefix examples |
 |--------|----------------------|
 | OTel Collector | `otelcol_*` |
-| OTel SDK | `otel.sdk.*` |
 | JVM | `jvm.*`, `process.runtime.jvm.*` |
 | Kubernetes | `k8s.*` |
 | Host / OS | `system.*`, `process.*` |
-| HTTP Instrumentation | `http.*` |
-| Database | `db.*`, `mysql.*`, `postgresql.*`, `redis.*` |
-| Messaging | `messaging.*`, `kafka.*` |
+| HTTP | `http.*` |
+| Database | `db.*`, `mysql.*`, `redis.*` |
+| Messaging | `kafka.*`, `messaging.*` |
 | Cloud | `aws.*`, `azure.*`, `gcp.*` |
-| Splunk Agent | `sf.*`, `splunk.*` |
+| Splunk internal | `sf.*`, `splunk.*` |
 
-## Anti-pattern detection
+### Anti-pattern detection
 
-Automatically flags dimensions whose values match high-cardinality patterns:
+Dimensions are checked for values that indicate unbounded cardinality:
 
 | Pattern | Example |
 |---------|---------|
 | UUID | `550e8400-e29b-41d4-a716-446655440000` |
 | IP address | `10.42.2.32` |
 | Timestamp / epoch | `1712345678901` |
-| MD5 hash | `d41d8cd98f00b204e9800998ecf8427e` |
-| SHA1 hash | `da39a3ee5e6b4b0d3255bfef95601890afd80709` |
+| MD5 / SHA1 hash | `d41d8cd98f00b204e9800998ecf8427e` |
 | Very long string | Any value > 100 characters |
 
-## Trend tracking
-
-After each scan, results are saved to `cardinality_state.db` (SQLite). On subsequent runs, each metric is compared to its previous value:
-
-- **🆕 NEW** — metric not seen in previous scan
-- **📈 GROWING** — MTS count increased >20% since last scan
-- **📉 FALLING** — MTS count decreased >20% (remediation may be working)
-- **➡️ STABLE** — within ±20% of last scan
-
-The state DB persists across runs — run `scan` or `report` regularly (e.g. daily via cron) to build trend history.
-
-## Watch mode events
-
-When running in `watch` mode, the tool emits custom events to Splunk Observability Cloud that can be used in dashboards and detectors:
-
-| Event type | Triggered when |
-|------------|---------------|
-| `cardinality.explosion.detected` | A metric crosses the MTS threshold for the first time |
-| `cardinality.explosion.growing` | An existing high-cardinality metric grew >50% since last poll |
-
-## Report output
-
-Reports are saved to `reports/cardinality_report_<timestamp>.md` and include:
-
-- **Header** — org realm, total MTS across findings, org limit and % used
-- **Summary table** — count by severity
-- **Trend alerts** — new metrics and growing metrics since last scan
-- **Top offenders table** — ranked with MTS count, % of org limit, trend, severity, source, worst dimension
-- **Per-service cardinality scorecard** — ranks services by total MTS contributed, affected metric count, and % of findings total
-- **Duplicate / similar metric groups** — two views:
-  - *By shared worst dimension*: all metrics with the same offending dimension grouped together with combined MTS and "one fix resolves all N" callout
-  - *By metric family*: `_bucket/_count/_sum/_min/_max/_total` variants grouped under their common root name, confirming they share the same problem dimension
-- **Fix suggestion YAML** — inline per group: ready-to-paste OTel Collector processor config to drop or hash the offending dimension (see below)
-- **Resolved findings** — metrics that previously exceeded thresholds and have since dropped >50% MTS; shown at the top of the report confirming the fix worked
-- **Detailed findings** — per-metric breakdown with dimension cardinality table, estimated cost, and sample values
-- **AI remediation** (CRITICAL/HIGH only) — root cause, OTel Collector processor config, SignalFlow rollup, estimated MTS reduction
-
-## Per-service cardinality scorecard
-
-Shows which services own the most cardinality across all findings. Useful for directing remediation effort to the highest-impact team.
-
-```
-| Rank | Service            | Total MTS | Affected Metrics | % of Findings Total |
-|------|--------------------|-----------|-----------------|---------------------|
-| 1    | customers-service  | 3,442     | 25              | 58.9%               |
-| 2    | api-gateway        | 3,298     | 22              | 56.5%               |
-| 3    | unknown            | 2,139     | 20              | 36.6%               |
-```
-
-## Duplicate / similar metric groups
-
-Identifies metrics that share the same root cardinality problem, so a single OTel Collector processor fix resolves multiple metrics at once.
-
-**Grouped by shared worst dimension:**
-```
-#### Dimension: `server.address` (21 unique values)
-Anti-pattern detected: IP address
-Combined MTS: 1,539 | Metrics in group: 5 | One fix resolves all 5
-
-| Metric                                  | MTS   | Severity    |
-|-----------------------------------------|-------|-------------|
-| http.client.request.duration_bucket     | 1,215 | CRITICAL    |
-| http.client.request.duration_min        | 81    | CRITICAL    |
-| http.client.request.duration_count      | 81    | CRITICAL    |
-| http.client.request.duration_sum        | 81    | CRITICAL    |
-| http.client.request.duration_max        | 81    | CRITICAL    |
-```
-
-**Grouped by metric family (same root name):**
-```
-#### Family: `http.client.request.duration_*`
-Combined MTS: 1,539 | Variants: 5 | Shared problem dimension: `server.address`
-```
-
-## HTML report
-
-```bash
-python3 cardinality_governance.py report --format html --no-ai
-```
-
-Generates a self-contained `.html` file in `reports/` — no external dependencies, shareable as a single file attachment. Opens automatically in the browser on macOS.
-
-**Six tabs:**
-- **Top Offenders** — full ranked table with MTS, cost, severity, trend, source, worst dimension
-- **Service Scorecard** — per-service MTS and cost with inline progress bars
-- **Duplicate Groups** — metrics sharing the same root cause, with collapsible fix YAML per group
-- **Resolved** — confirmed remediations with MTS and cost savings
-- **Detailed Findings** — collapsible per-metric detail with dimension tables and AI remediation
-- **Ignored** — active ignore patterns
-
-**All tables are sortable** — click any column header to sort ascending/descending.
-
-**Summary cards** at the top show total MTS, estimated cost, severity counts, and cumulative savings at a glance.
-
-## False positive suppression
-
-Some metrics will always appear as findings even though nothing can be done about them — `sf.org.*` Splunk internal metrics, `otelcol_*` collector self-telemetry, etc. The ignore list excludes these permanently so the report stays focused on actionable findings.
-
-```bash
-# Ignore Splunk internal metrics
-python3 cardinality_governance.py ignore "sf.org.*" --reason "Splunk internal — cannot remediate"
-
-# Ignore OTel Collector internal metrics
-python3 cardinality_governance.py ignore "otelcol_*" --reason "Collector internal telemetry"
-
-# List active patterns
-python3 cardinality_governance.py ignored
-
-# Remove a pattern
-python3 cardinality_governance.py unignore "sf.org.*"
-```
-
-Patterns support `fnmatch` glob syntax (`*` matches any characters, `?` matches one character). Ignored patterns are stored in `cardinality_state.db` and persist across runs. The report Summary table shows the ignored count.
-
-## Scan history
-
-Every `scan` or `report` run saves a summary row to SQLite. The `history` command shows the trend over time:
-
-```bash
-python3 cardinality_governance.py history
-```
-
-```
-Scan history (realm=us1, last 7 scans)
-
-Date                    Metrics  Total MTS  Est Cost/Mo     🔴     🟠     🟡  Ignored
-2026-04-01 08:00          1,038     12,450     ~$24.90     8      5      3       12
-2026-04-02 08:00          1,041     13,200     ~$26.40    10      5      3       12
-2026-04-03 08:00          1,041      9,800     ~$19.60     6      4      3       12
-...
-
-Trend over 7 scans: 📉 DOWN 21.3%  (-2,650 MTS  /  ~-$5.30/mo)
-```
-
-Shows whether the org's cardinality is trending better or worse, and quantifies the impact of remediations over time.
-
-## Dimension drill-down
-
-Before applying a fix, use `drilldown` to see the full blast radius — every metric carrying the dimension, not just the ones that crossed severity thresholds.
-
-```bash
-python3 cardinality_governance.py drilldown --dimension server.address
-```
-
-Output:
-```
-Dimension drill-down: `server.address` (realm=us1)
-
-  Found 16 metric(s) carrying `server.address`
-  Combined MTS: 861  |  Est. cost: ~$1.72/mo
-  Max unique values seen: 21
-  Anti-pattern detected: IP address
-
-Rank  Metric                               MTS   Unique Values  Pattern     Source                Services
-1     http.client.request.duration_min      81              21  IP address  HTTP Instrumentation  admin-server, api-gateway
-2     http.client.request.duration_bucket  500              11  IP address  HTTP Instrumentation  admin-server, api-gateway
-3     coredns_dns_requests_total             4               1  IP address  Kubernetes (app)      coredns
-...
-
-FIX: Drop `server.address` from all 16 affected metrics
-======================================================================
-processors:
-  transform/drop_server_address:
-    ...
-```
-
-The drill-down often reveals more affected metrics than the report's duplicate grouping — low-MTS metrics that didn't cross the severity threshold but share the same problematic dimension. The generated fix YAML covers all of them in one config block.
-
-## Cost estimation and savings
-
-MTS count is converted to an estimated monthly cost throughout the report. The default rate is **$0.002 per MTS per month** — a conservative mid-tier estimate for Splunk Observability Cloud custom metrics.
-
-Override the rate to match your org's actual contract:
-```bash
-export MTS_COST_PER_MONTH=0.005   # $0.005/MTS/mo (higher tier)
-python3 cardinality_governance.py report
-```
-
-Cost appears in three places:
-- **Report header** — total estimated cost across all findings
-- **Top Offenders table** — `Est. Cost/Mo` column per metric
-- **Per-Service Scorecard** — `Est. Cost/Mo` column per service
-
-Example header output:
-```
-Total MTS across findings: 2,500,000
-Estimated monthly cost (findings only): ~$5,000.00/mo (at $0.002/MTS/mo)
-Cumulative savings (resolved findings): 800,000 MTS / ~$1,600.00/mo saved across 3 resolved metric(s) 🎉
-```
-
-As fixes are applied and metrics are marked resolved, the savings line grows — giving a running total of cost reduction attributed to the governance program.
-
-## Remediation tracking
-
-Closes the loop between finding a problem and confirming the fix worked.
-
-**Auto-detection:** every `scan` or `report` run checks whether each metric's current MTS has dropped >50% vs its historical peak. If so, it's automatically marked resolved and a `[RESOLVED]` notice is printed.
-
-**Manual resolve:** after deploying the generated OTel Collector processor config, mark the fix explicitly:
-```bash
-python3 cardinality_governance.py resolve \
-  --metric http.client.request.duration_bucket \
-  --note "applied delete_key(server.address) in collector config v1.2"
-```
-
-**Resolved findings** appear at the top of the next report:
-```
-## Resolved Findings
-> These metrics previously exceeded severity thresholds and have since dropped >50% — fix confirmed working.
-
-| Metric                              | Peak MTS | Current MTS | Reduction | Resolved At | How  |
-|-------------------------------------|----------|-------------|-----------|-------------|------|
-| http.client.request.duration_bucket | 1,215    | 400         | -67.1%    | 2026-04-06  | auto |
-```
-
-Resolution state is stored in `cardinality_state.db`. If a resolved metric later re-explodes past the threshold, it will reappear in Top Offenders on the next scan.
-
-## Fix suggestion generator
+### Fix suggestion generator
 
 Every duplicate group in the report includes two ready-to-paste OTel Collector processor configs.
 
-**Option 1 — Drop the dimension entirely** (shown inline):
+**Option 1 — Drop the dimension** (eliminates the cardinality explosion):
 ```yaml
-# OTel Collector processor — drop `server.address` from 5 metric(s)
-# Dimension has 21 unique values (IP address)
-# Effect: eliminates the cardinality explosion; metric is still reported per remaining dimensions.
 processors:
   transform/drop_server_address:
     metric_statements:
       - context: datapoint
         statements:
-          - delete_key(attributes, "server.address")  # anti-pattern: IP address
-        # Apply only to these metrics (remove 'include' block to apply to all):
+          - delete_key(attributes, "server.address")
         include:
           match_type: strict
           metric_names:
             - 'http.client.request.duration_bucket'
             - 'http.client.request.duration_count'
-            - 'http.client.request.duration_max'
-            - 'http.client.request.duration_min'
             - 'http.client.request.duration_sum'
 
 service:
@@ -420,7 +288,7 @@ service:
       processors: [transform/drop_server_address, ...]
 ```
 
-**Option 2 — Hash instead of drop** (collapsible, use when cross-restart correlation is needed):
+**Option 2 — Hash instead of drop** (preserves groupability without cardinality explosion):
 ```yaml
 processors:
   transform/hash_server_address:
@@ -430,161 +298,138 @@ processors:
           - set(attributes["server.address"], SHA256(attributes["server.address"]))
         include:
           match_type: strict
-          metric_names:
-            - 'http.client.request.duration_bucket'
-            ...
+          metric_names: [...]
 ```
 
-Each processor is named `transform/drop_<dim>` or `transform/hash_<dim>` and scoped to only the affected metrics via `include.metric_names`, so it won't accidentally affect unrelated metrics that happen to share the same dimension name.
+Each processor is scoped to only the affected metrics via `include.metric_names`.
 
-## MTS spike comparison
+### Dimension drill-down
 
-Compare MTS counts between any two points in time to identify what caused a cardinality spike and which service/token is responsible.
+Full blast radius for a dimension — including low-MTS metrics that didn't cross severity thresholds:
 
 ```bash
-# Compare stored April 1 snapshot vs live data now
-python3 cardinality_governance.py compare --date1 2026-04-01 --date2 now
-
-# Compare two stored scan dates
-python3 cardinality_governance.py compare --date1 2026-03-20 --date2 2026-04-01
-
-# Lower threshold to catch smaller changes; also show drops
-python3 cardinality_governance.py compare --date1 2026-04-01 --date2 now \
-  --min-delta 10 --show-dropped
-
-# Focus on top 10 biggest movers
-python3 cardinality_governance.py compare --date1 2026-04-01 --date2 now --top 10 --no-new
+python3 cardinality_governance.py drilldown --dimension server.address
 ```
 
-**Output sections:**
-
-| Section | What it shows |
-|---|---|
-| Summary header | Total MTS baseline → compared, net delta, monthly cost impact |
-| Top MTS Increases | Metrics that grew by ≥ `--min-delta` MTS, sorted by delta |
-| Source breakdown | Aggregates increases by instrumentation source (OTel SDK, OTel Collector, Kubernetes, etc.) |
-| Token breakdown | Aggregates increases by ingest token — pinpoints which pipeline/team drove the spike |
-| New Metrics | Metrics that appear in the compared snapshot but not the baseline |
-| Biggest Drops | (with `--show-dropped`) Metrics that shrank most |
-
-**How dates work:**
-- `now` — fetches a live snapshot from the API (takes ~2-5 minutes for large orgs)
-- `YYYY-MM-DD` or `YYYY-MM-DDTHH:MM` — looks up the stored scan closest to that date/time
-- If no stored scan is available near the given date, falls back to a live API fetch
-
-**Tip:** Run `scan` regularly (e.g. daily via cron) to build up history, then use `compare` to instantly diff any two stored dates without re-fetching data.
-
-**Example output:**
 ```
-MTS Spike Comparison  (realm=us1)  generated 2026-04-06 16:29 UTC
+Dimension drill-down: `server.address`
 
-  Baseline  (2026-04-05T04:29):       4,283 MTS   ~$8.57/mo
-  Compared  (2026-04-06T16:29):       8,493 MTS   ~$16.99/mo
-  Net change:               +    4,210 MTS  (+98.3%)   ~$8.42/mo added
+  16 metrics carry this dimension
+  Combined MTS: 861  |  Est. cost: ~$1.72/mo
+  Max unique values: 21  |  Anti-pattern: IP address
 
-========================================================================================================================
-  TOP MTS INCREASES  (>=100 MTS delta)  --  12 metric(s)
-========================================================================================================================
-Rank  Metric                                             Baseline    Current      Delta   Change  Source                    Services / Token
-1     http.server.request.duration_bucket                     120         480       +360   +200.0%  OTel SDK (app)            api-gateway, customers-service [petclinic-INGEST]
-2     http.client.request.duration_bucket                      80         320       +240   +200.0%  OTel SDK (app)            visits-service [petclinic-INGEST]
+Rank  Metric                               MTS   Unique Values  Services
+1     http.client.request.duration_bucket  500              11  api-gateway
+2     http.client.request.duration_min      81              21  api-gateway, admin-server
 ...
 
-  Source breakdown for increased metrics:
-  Source                         Metrics    MTS Added     Cost Added
-  OTel SDK (app)                      8        2,840      ~$5.68/mo
-  OTel Collector                      3          890      ~$1.78/mo
-
-  Token breakdown for increased metrics:
-  Token                              Metrics    MTS Added
-  petclinic-INGEST                        8        2,840
-  petclinicmcptest-INGEST                 3          890
-
-========================================================================================================================
-  NEW METRICS  (first seen in compared snapshot)  --  5 metric(s)
-========================================================================================================================
-Rank  Metric                                                  MTS  Source                    Services / Token
-1     otelcol_k8s_pod_association                              65  OTel Collector            otel-agent
+FIX: Drop `server.address` from all 16 metrics  [YAML follows]
 ```
 
-## Trace (APM) spike comparison
+### Remediation tracking
 
-Identify which services drove a spike in trace/span volume (TAPM) by comparing two time windows.
+**Auto-detection:** each scan checks whether any metric's MTS dropped >50% vs its historical peak and marks it resolved automatically.
+
+**Manual resolve:**
+```bash
+python3 cardinality_governance.py resolve \
+  --metric http.client.request.duration_bucket \
+  --note "applied delete_key(server.address) in collector v1.2"
+```
+
+Resolved findings appear at the top of the next report confirming the fix worked.
+
+### Cost estimation
+
+Default rate: **$0.002/MTS/month**. Override to match your contract:
 
 ```bash
-# Step 1: save a snapshot of current trace volumes
-python3 cardinality_governance.py trace-scan --environment petclinicmbtest
-
-# Step 2: compare a stored snapshot vs live data now
-python3 cardinality_governance.py trace-compare \
-  --date1 2026-04-01 --date2 now --environment petclinicmbtest
-
-# Compare two stored dates
-python3 cardinality_governance.py trace-compare \
-  --date1 2026-03-20 --date2 2026-04-01 --environment petclinicmbtest
-
-# Lower the delta threshold and show services that dropped too
-python3 cardinality_governance.py trace-compare \
-  --date1 2026-04-01 --date2 now --environment petclinicmbtest \
-  --min-delta 5 --show-dropped
-
-# All environments (no filter)
-python3 cardinality_governance.py trace-compare --date1 2026-04-01 --date2 now
+export MTS_COST_PER_MONTH=0.005
 ```
 
-**Output sections:**
+Cost appears in the report header, Top Offenders table, per-service scorecard, and `compare` output. The report header shows cumulative savings across all resolved metrics.
 
-| Section | What it shows |
-|---|---|
-| Summary header | Total sampled spans baseline → compared, net delta |
-| Top Span Increases | Services with ≥ `--min-delta` span growth, with error rate change |
-| New Services | Services that appear in compared but not baseline |
-| Biggest Drops | (with `--show-dropped`) Services that shrank most |
+### False positive suppression
 
-**`trace-scan` options:**
+```bash
+python3 cardinality_governance.py ignore "sf.org.*" --reason "Splunk internal"
+python3 cardinality_governance.py ignore "otelcol_*" --reason "Collector telemetry"
+python3 cardinality_governance.py ignored
+python3 cardinality_governance.py unignore "sf.org.*"
+```
 
-| Flag | Default | Description |
-|---|---|---|
-| `--environment` / `-e` | all | APM environment to filter |
-| `--lookback` | 1.0 | Hours of trace history to sample |
-| `--no-save` | off | Print only, don't persist snapshot |
+Patterns use `fnmatch` glob syntax (`*` matches any characters). Stored in `cardinality_state.db`.
 
-**`trace-compare` options:**
+### Scan history
 
-| Flag | Default | Description |
-|---|---|---|
-| `--date1` / `--date2` | required | `YYYY-MM-DD`, `YYYY-MM-DDTHH:MM`, or `now` |
-| `--environment` / `-e` | all | APM environment (strongly recommended) |
-| `--min-delta` | 10 | Minimum span count change to include |
-| `--top` | 20 | Max services per section |
-| `--lookback` | 1.0 | Window size (hours) for live snapshots |
-| `--show-dropped` | off | Show services with biggest decreases |
-| `--no-new` | off | Hide new services section |
+```bash
+python3 cardinality_governance.py history
+```
 
-**How it works:**
+```
+Date                    Metrics  Total MTS  Est Cost/Mo   CRIT  HIGH  MED  Ignored
+2026-04-01 08:00          1,038     12,450     ~$24.90      8     5    3       12
+2026-04-02 08:00          1,041     13,200     ~$26.40     10     5    3       12
+2026-04-03 08:00          1,041      9,800     ~$19.60      6     4    3       12
 
-Span counts are derived from a 200-trace sample per window. The sample is proportional, so relative changes between services are reliable — a service whose span count doubles in the sample has roughly doubled in reality. Absolute counts reflect the sample, not total ingest volume.
+Trend over 7 scans: DOWN 21.3%  (-2,650 MTS / ~-$5.30/mo)
+```
 
-The `--environment` filter is strongly recommended to avoid mixing data from dev/staging/prod.
+### HTML report
 
-**Tip:** Add `trace-scan` to cron to build history:
+```bash
+python3 cardinality_governance.py report --format html --no-ai
+```
+
+Generates a self-contained `.html` file in `reports/` — no external dependencies, shareable as a single attachment. Six tabs: Top Offenders, Service Scorecard, Duplicate Groups (with collapsible fix YAML), Resolved, Detailed Findings, Ignored. All tables are sortable.
+
+### Watch mode
+
+```bash
+python3 cardinality_governance.py watch --interval 300 --threshold 5000
+```
+
+Polls on an interval and emits custom events to Splunk:
+
+| Event | Trigger |
+|-------|---------|
+| `cardinality.explosion.detected` | Metric crosses threshold for the first time |
+| `cardinality.explosion.growing` | Existing high-cardinality metric grew >50% |
+
+---
+
+## State and persistence
+
+All state is stored in `cardinality_state.db` (SQLite, created automatically):
+
+| Table | Contents |
+|-------|----------|
+| `scans` | Per-metric MTS count per scan run — powers trend tracking and `compare` |
+| `scan_summaries` | Per-run totals — powers `history` |
+| `remediations` | Resolved findings with peak/current MTS and reduction % |
+| `ignored` | Active ignore patterns |
+| `trace_snapshots` | Per-service span counts per `trace-scan` run — powers `trace-compare` |
+
+---
+
+## Recommended cron
+
 ```cron
-0 * * * *  cd /path/to/cardinality-governance && SPLUNK_ACCESS_TOKEN=... python3 cardinality_governance.py trace-scan --environment myenv
+# Daily metric scan — builds history for compare and trend tracking
+0 8 * * *  cd /path/to/o11y-usage-governance && \
+           SPLUNK_ACCESS_TOKEN=... SPLUNK_REALM=us1 \
+           python3 cardinality_governance.py scan --top 100
+
+# Hourly trace snapshot — builds history for trace-compare
+0 * * * *  cd /path/to/o11y-usage-governance && \
+           SPLUNK_ACCESS_TOKEN=... SPLUNK_REALM=us1 \
+           python3 cardinality_governance.py trace-scan --environment myenv
 ```
 
-**Example output:**
-```
-Trace Spike Comparison  (realm=us1)  env=petclinicmbtest  generated 2026-04-06 16:50 UTC
+---
 
-  Baseline  (2026-04-01T08:00):         312 spans sampled
-  Compared  (2026-04-06T16:50):         673 spans sampled
-  Net change:               +      361 spans  (+115.7%)
+## Requirements
 
-===================================================================================================================
-  TOP SPAN INCREASES  (>=10 span delta)  --  3 service(s)
-===================================================================================================================
-  Service                              Baseline   Current     Delta   Change  ErrRate Baseline  ErrRate Now  Err Delta
-  api-gateway                               85       221      +136  +160.0%             0.0%         0.0%      +0.0pp
-  customers-service                         63       211      +148  +234.9%             2.1%         0.0%      -2.1pp
-  mysql:petclinic                           40       137       +97  +242.5%             0.0%         0.0%      +0.0pp
-```
+- Python 3.9+
+- `requests` — Splunk API calls
+- `boto3` — optional, required only for AI remediation (Claude via AWS Bedrock)
