@@ -25,7 +25,9 @@ High-cardinality metrics are the #1 cause of surprise overage bills in Splunk Ob
 9. **Fix suggestion generator** — for each duplicate group, auto-generates ready-to-paste OTel Collector `transform` processor YAML with the exact `delete_key()` statement and metric allow-list scoped to only the affected metrics; includes a collapsible SHA256-hash alternative
 10. **Remediation tracking** — automatically detects when a metric's MTS drops >50% vs its historical peak and marks it resolved; supports manual `resolve` command; resolved findings appear at the top of the next report confirming the fix worked
 11. **Cost estimation** — maps MTS count to estimated monthly cost (default `$0.002/MTS/mo`, configurable via `MTS_COST_PER_MONTH` env var); shown in report header, Top Offenders table, and per-service scorecard
-12. **AI remediation** — for CRITICAL and HIGH findings, calls Claude to generate specific OTel Collector processor configs, SignalFlow rollups, and estimated MTS reduction
+12. **Savings summary** — report header and Resolved Findings section show cumulative MTS and cost saved across all remediated metrics
+13. **Dimension drill-down** — `drilldown --dimension <name>` scans every metric in the org for that dimension, ranks by unique value count, shows combined MTS + cost, and generates a single fix YAML covering the full blast radius
+14. **AI remediation** — for CRITICAL and HIGH findings, calls Claude to generate specific OTel Collector processor configs, SignalFlow rollups, and estimated MTS reduction
 
 ## Modes
 
@@ -36,6 +38,7 @@ High-cardinality metrics are the #1 cause of surprise overage bills in Splunk Ob
 | `watch` | Continuous polling — emits Splunk custom events on new explosions and growth spikes |
 | `rollup` | Deep-dive on a single metric — dimension analysis + SignalFlow rollup + OTel processor config |
 | `resolve` | Manually mark a metric as remediated after applying a fix |
+| `drilldown` | Show every metric carrying a given dimension — full blast radius + combined fix YAML |
 
 ## Setup
 
@@ -86,6 +89,10 @@ python3 cardinality_governance.py rollup --metric http.client.request.duration_b
 # Manually mark a metric as resolved after applying a fix
 python3 cardinality_governance.py resolve --metric http.client.request.duration_bucket
 python3 cardinality_governance.py resolve --metric http.client.request.duration_bucket --note "applied delete_key(server.address) in collector v1.2"
+
+# Dimension drill-down — full blast radius for a specific dimension
+python3 cardinality_governance.py drilldown --dimension server.address
+python3 cardinality_governance.py drilldown --dimension container.id --top 20
 ```
 
 ## Scan output columns
@@ -216,7 +223,39 @@ Combined MTS: 1,539 | Metrics in group: 5 | One fix resolves all 5
 Combined MTS: 1,539 | Variants: 5 | Shared problem dimension: `server.address`
 ```
 
-## Cost estimation
+## Dimension drill-down
+
+Before applying a fix, use `drilldown` to see the full blast radius — every metric carrying the dimension, not just the ones that crossed severity thresholds.
+
+```bash
+python3 cardinality_governance.py drilldown --dimension server.address
+```
+
+Output:
+```
+Dimension drill-down: `server.address` (realm=us1)
+
+  Found 16 metric(s) carrying `server.address`
+  Combined MTS: 861  |  Est. cost: ~$1.72/mo
+  Max unique values seen: 21
+  Anti-pattern detected: IP address
+
+Rank  Metric                               MTS   Unique Values  Pattern     Source                Services
+1     http.client.request.duration_min      81              21  IP address  HTTP Instrumentation  admin-server, api-gateway
+2     http.client.request.duration_bucket  500              11  IP address  HTTP Instrumentation  admin-server, api-gateway
+3     coredns_dns_requests_total             4               1  IP address  Kubernetes (app)      coredns
+...
+
+FIX: Drop `server.address` from all 16 affected metrics
+======================================================================
+processors:
+  transform/drop_server_address:
+    ...
+```
+
+The drill-down often reveals more affected metrics than the report's duplicate grouping — low-MTS metrics that didn't cross the severity threshold but share the same problematic dimension. The generated fix YAML covers all of them in one config block.
+
+## Cost estimation and savings
 
 MTS count is converted to an estimated monthly cost throughout the report. The default rate is **$0.002 per MTS per month** — a conservative mid-tier estimate for Splunk Observability Cloud custom metrics.
 
@@ -235,7 +274,10 @@ Example header output:
 ```
 Total MTS across findings: 2,500,000
 Estimated monthly cost (findings only): ~$5,000.00/mo (at $0.002/MTS/mo)
+Cumulative savings (resolved findings): 800,000 MTS / ~$1,600.00/mo saved across 3 resolved metric(s) 🎉
 ```
+
+As fixes are applied and metrics are marked resolved, the savings line grows — giving a running total of cost reduction attributed to the governance program.
 
 ## Remediation tracking
 
