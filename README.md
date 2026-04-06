@@ -23,7 +23,8 @@ High-cardinality metrics are the #1 cause of surprise overage bills in Splunk Ob
 7. **Per-service scorecard** — ranks services/teams by total MTS contributed across all findings, showing ownership and % of total
 8. **Duplicate metric grouping** — identifies metrics sharing the same high-cardinality dimension and groups metric families (e.g. `_bucket/_count/_sum/_min/_max` variants) — one fix resolves the whole group
 9. **Fix suggestion generator** — for each duplicate group, auto-generates ready-to-paste OTel Collector `transform` processor YAML with the exact `delete_key()` statement and metric allow-list scoped to only the affected metrics; includes a collapsible SHA256-hash alternative
-10. **AI remediation** — for CRITICAL and HIGH findings, calls Claude to generate specific OTel Collector processor configs, SignalFlow rollups, and estimated MTS reduction
+10. **Remediation tracking** — automatically detects when a metric's MTS drops >50% vs its historical peak and marks it resolved; supports manual `resolve` command; resolved findings appear at the top of the next report confirming the fix worked
+11. **AI remediation** — for CRITICAL and HIGH findings, calls Claude to generate specific OTel Collector processor configs, SignalFlow rollups, and estimated MTS reduction
 
 ## Modes
 
@@ -33,6 +34,7 @@ High-cardinality metrics are the #1 cause of surprise overage bills in Splunk Ob
 | `report` | Full Markdown report saved to `reports/` with AI remediation for CRITICAL/HIGH |
 | `watch` | Continuous polling — emits Splunk custom events on new explosions and growth spikes |
 | `rollup` | Deep-dive on a single metric — dimension analysis + SignalFlow rollup + OTel processor config |
+| `resolve` | Manually mark a metric as remediated after applying a fix |
 
 ## Setup
 
@@ -79,6 +81,10 @@ python3 cardinality_governance.py watch --threshold 5000
 
 # Deep-dive rollup suggestion for a specific metric
 python3 cardinality_governance.py rollup --metric http.client.request.duration_bucket
+
+# Manually mark a metric as resolved after applying a fix
+python3 cardinality_governance.py resolve --metric http.client.request.duration_bucket
+python3 cardinality_governance.py resolve --metric http.client.request.duration_bucket --note "applied delete_key(server.address) in collector v1.2"
 ```
 
 ## Scan output columns
@@ -168,6 +174,7 @@ Reports are saved to `reports/cardinality_report_<timestamp>.md` and include:
   - *By shared worst dimension*: all metrics with the same offending dimension grouped together with combined MTS and "one fix resolves all N" callout
   - *By metric family*: `_bucket/_count/_sum/_min/_max/_total` variants grouped under their common root name, confirming they share the same problem dimension
 - **Fix suggestion YAML** — inline per group: ready-to-paste OTel Collector processor config to drop or hash the offending dimension (see below)
+- **Resolved findings** — metrics that previously exceeded thresholds and have since dropped >50% MTS; shown at the top of the report confirming the fix worked
 - **Detailed findings** — per-metric breakdown with dimension cardinality table and sample values
 - **AI remediation** (CRITICAL/HIGH only) — root cause, OTel Collector processor config, SignalFlow rollup, estimated MTS reduction
 
@@ -207,6 +214,31 @@ Combined MTS: 1,539 | Metrics in group: 5 | One fix resolves all 5
 #### Family: `http.client.request.duration_*`
 Combined MTS: 1,539 | Variants: 5 | Shared problem dimension: `server.address`
 ```
+
+## Remediation tracking
+
+Closes the loop between finding a problem and confirming the fix worked.
+
+**Auto-detection:** every `scan` or `report` run checks whether each metric's current MTS has dropped >50% vs its historical peak. If so, it's automatically marked resolved and a `[RESOLVED]` notice is printed.
+
+**Manual resolve:** after deploying the generated OTel Collector processor config, mark the fix explicitly:
+```bash
+python3 cardinality_governance.py resolve \
+  --metric http.client.request.duration_bucket \
+  --note "applied delete_key(server.address) in collector config v1.2"
+```
+
+**Resolved findings** appear at the top of the next report:
+```
+## Resolved Findings
+> These metrics previously exceeded severity thresholds and have since dropped >50% — fix confirmed working.
+
+| Metric                              | Peak MTS | Current MTS | Reduction | Resolved At | How  |
+|-------------------------------------|----------|-------------|-----------|-------------|------|
+| http.client.request.duration_bucket | 1,215    | 400         | -67.1%    | 2026-04-06  | auto |
+```
+
+Resolution state is stored in `cardinality_state.db`. If a resolved metric later re-explodes past the threshold, it will reappear in Top Offenders on the next scan.
 
 ## Fix suggestion generator
 
