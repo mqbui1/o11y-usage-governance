@@ -58,8 +58,12 @@ CARDINALITY_PATTERNS = [
 
 REPORTS_DIR  = Path("reports")
 STATE_DB     = Path("cardinality_state.db")
-TREND_GROWTH_WARN   = 0.20   # flag if MTS grew >20% since last scan
-REMEDIATION_DROP_PCT = 0.50  # mark resolved if MTS dropped >50% vs peak
+TREND_GROWTH_WARN    = 0.20   # flag if MTS grew >20% since last scan
+REMEDIATION_DROP_PCT = 0.50   # mark resolved if MTS dropped >50% vs peak
+
+# Cost estimation — override with MTS_COST_PER_MONTH env var
+# Default: $0.002 per MTS per month (conservative mid-tier estimate)
+MTS_COST_PER_MONTH = float(os.environ.get("MTS_COST_PER_MONTH", "0.002"))
 
 # ---------------------------------------------------------------------------
 # API helpers
@@ -408,6 +412,17 @@ def severity(mts_count):
     elif mts_count >= MEDIUM_MTS_COUNT:
         return "MEDIUM"
     return "LOW"
+
+
+def estimate_cost(mts_count):
+    """Return estimated monthly cost string for a given MTS count."""
+    cost = mts_count * MTS_COST_PER_MONTH
+    if cost >= 1000:
+        return f"~${cost:,.0f}/mo"
+    elif cost >= 1:
+        return f"~${cost:.2f}/mo"
+    else:
+        return f"~${cost:.4f}/mo"
 
 
 # Instrumentation source rules: (metric prefix/pattern, source label, description)
@@ -792,6 +807,8 @@ def generate_report(findings, use_claude=True):
     lines.append(f"**Realm:** {REALM}")
     lines.append(f"**Metrics analyzed:** {len(findings)}")
     lines.append(f"**Total MTS across findings:** {total_mts:,}")
+    total_cost = total_mts * MTS_COST_PER_MONTH
+    lines.append(f"**Estimated monthly cost (findings only):** ~${total_cost:,.2f}/mo *(at ${MTS_COST_PER_MONTH}/MTS/mo — override with `MTS_COST_PER_MONTH` env var)*")
 
     # Org limit section
     org = fetch_org_info()
@@ -841,19 +858,20 @@ def generate_report(findings, use_claude=True):
         lines.append("")
 
     lines.append(f"\n## Top Offenders\n")
-    lines.append(f"| Rank | Metric | MTS Count | % of Limit | Trend | Severity | Instrumentation Source | Worst Dimension | Attributed To |")
-    lines.append(f"|------|--------|-----------|------------|-------|----------|-----------------------|----------------|---------------|")
+    lines.append(f"| Rank | Metric | MTS Count | Est. Cost/Mo | % of Limit | Trend | Severity | Instrumentation Source | Worst Dimension | Attributed To |")
+    lines.append(f"|------|--------|-----------|--------------|------------|-------|----------|-----------------------|----------------|---------------|")
     for i, f in enumerate(findings[:20], 1):
-        worst      = f["worst_dim"] or "—"
+        worst       = f["worst_dim"] or "—"
         worst_count = f["worst_dim_info"]["unique_values"] if f["worst_dim_info"] else 0
-        teams      = ", ".join(f["attributed_to"][:2])
-        sev_icon   = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡"}.get(f["severity"], "⚪")
-        trend_icon = {"GROWING": "📈", "FALLING": "📉", "NEW": "🆕", "STABLE": "➡️"}.get(f.get("trend", ""), "")
-        limit_str  = f"{f['limit_pct']}%" if f.get("limit_pct") is not None else "—"
-        trend_str  = f"{trend_icon} {f.get('trend','')}"
+        teams       = ", ".join(f["attributed_to"][:2])
+        sev_icon    = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡"}.get(f["severity"], "⚪")
+        trend_icon  = {"GROWING": "📈", "FALLING": "📉", "NEW": "🆕", "STABLE": "➡️"}.get(f.get("trend", ""), "")
+        limit_str   = f"{f['limit_pct']}%" if f.get("limit_pct") is not None else "—"
+        trend_str   = f"{trend_icon} {f.get('trend','')}"
         if f.get("growth_pct") and f.get("trend") == "GROWING":
             trend_str += f" +{int(f['growth_pct']*100)}%"
-        lines.append(f"| {i} | `{f['metric']}` | {f['mts_count']:,} | {limit_str} | {trend_str} | {sev_icon} {f['severity']} | {f['instr_source']} | `{worst}` ({worst_count:,} values) | {teams} |")
+        cost_str    = estimate_cost(f["mts_count"])
+        lines.append(f"| {i} | `{f['metric']}` | {f['mts_count']:,} | {cost_str} | {limit_str} | {trend_str} | {sev_icon} {f['severity']} | {f['instr_source']} | `{worst}` ({worst_count:,} values) | {teams} |")
 
     # -----------------------------------------------------------------------
     # #10: Per-service cardinality scorecard
@@ -867,13 +885,13 @@ def generate_report(findings, use_claude=True):
 
     if service_mts:
         lines.append(f"\n## Per-Service Cardinality Scorecard\n")
-        lines.append(f"| Rank | Service | Total MTS | Affected Metrics | % of Findings Total |")
-        lines.append(f"|------|---------|-----------|-----------------|---------------------|")
+        lines.append(f"| Rank | Service | Total MTS | Est. Cost/Mo | Affected Metrics | % of Findings Total |")
+        lines.append(f"|------|---------|-----------|--------------|-----------------|---------------------|")
         sorted_svcs = sorted(service_mts.items(), key=lambda x: -x[1])
         for rank, (svc, svc_total) in enumerate(sorted_svcs, 1):
             svc_pct = round(svc_total / total_mts * 100, 1) if total_mts else 0
             metric_count = len(service_metrics[svc])
-            lines.append(f"| {rank} | `{svc}` | {svc_total:,} | {metric_count} | {svc_pct}% |")
+            lines.append(f"| {rank} | `{svc}` | {svc_total:,} | {estimate_cost(svc_total)} | {metric_count} | {svc_pct}% |")
 
     # -----------------------------------------------------------------------
     # #9: Duplicate / similar metric grouping
@@ -970,6 +988,7 @@ def generate_report(findings, use_claude=True):
             trend_str = f"{trend_icon} {trend_str} (first scan)"
 
         lines.append(f"\n- **MTS count:** {f['mts_count']:,}")
+        lines.append(f"- **Estimated cost:** {estimate_cost(f['mts_count'])} *(${MTS_COST_PER_MONTH}/MTS/mo)*")
         if f.get("limit_pct") is not None:
             lines.append(f"- **% of org MTS limit:** {f['limit_pct']}%")
         lines.append(f"- **Trend:** {trend_str}")
