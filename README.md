@@ -433,3 +433,132 @@ All state is stored in `cardinality_state.db` (SQLite, created automatically):
 - Python 3.9+
 - `requests` — Splunk API calls
 - `boto3` — optional, required only for AI remediation (Claude via AWS Bedrock)
+
+---
+
+## Unified comparison: `usage-compare`
+
+Runs metric MTS and trace span comparisons together in a single output. Designed for post-incident reviews where you want to see the full picture across both signals at once.
+
+```bash
+# Compare both signals between a stored date and now
+python3 cardinality_governance.py usage-compare \
+  --date1 2026-04-01 --date2 now --environment petclinicmbtest
+
+# Two stored dates
+python3 cardinality_governance.py usage-compare \
+  --date1 2026-03-20 --date2 2026-04-01 --environment petclinicmbtest
+
+# Adjust per-signal thresholds
+python3 cardinality_governance.py usage-compare \
+  --date1 2026-04-01 --date2 now \
+  --metric-min-delta 50 --trace-min-delta 5
+```
+
+**Output structure:**
+
+```
+========================================================================================================================
+  USAGE COMPARE  |  realm=us1  |  env=petclinicmbtest  |  2026-04-06 17:05 UTC
+  Baseline: 2026-04-01   vs   Compared: now
+========================================================================================================================
+
+  [METRICS]  MTS cardinality comparison
+  ...top metric increases, source breakdown...
+
+  [TRACES]  APM span volume comparison
+  ...top span increases by service, error rate changes...
+
+========================================================================================================================
+  SIGNAL SUMMARY
+========================================================================================================================
+
+  Both MTS and span volumes changed — likely a deployment or configuration change.
+  Services implicated in BOTH signals: api-gateway, customers-service
+  These are the highest-priority services to investigate.
+
+  Metric change:  +4,210 MTS  (+98.3%)   ~$8.42/mo added
+  Trace change:   +361 spans sampled  (+115.7%)
+```
+
+The signal summary cross-references the two signals and highlights services that appear in both — these are the most likely root cause of a billing spike or incident.
+
+**Options:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--date1` / `--date2` | required | `YYYY-MM-DD`, `YYYY-MM-DDTHH:MM`, or `now` |
+| `--environment` / `-e` | all | APM environment for trace section |
+| `--metric-min-delta` | 100 | Minimum MTS change for metric section |
+| `--trace-min-delta` | 10 | Minimum span delta for trace section |
+| `--top` | 20 | Max rows per section |
+| `--lookback` | 1.0 | Hours per window for live trace snapshots |
+| `--show-dropped` | off | Show metrics/services that decreased |
+
+---
+
+## Anomaly detection: `anomaly-scan`
+
+Flags metrics that are growing faster than their own historical baseline — regardless of whether they've crossed a static threshold. Catches slow-burn cardinality explosions early, before they become billing surprises.
+
+```bash
+# Default: flag metrics at 2x their 7-day average
+python3 cardinality_governance.py anomaly-scan
+
+# More sensitive: flag at 1.5x
+python3 cardinality_governance.py anomaly-scan --ratio 1.5
+
+# Longer baseline window
+python3 cardinality_governance.py anomaly-scan --ratio 2.0 --days 14
+
+# Require fewer history points (useful when history is sparse)
+python3 cardinality_governance.py anomaly-scan --min-samples 2
+```
+
+**Output:**
+
+```
+Anomaly Scan  (realm=us1)
+  Threshold: current MTS >= 2.0x 7-day average  |  min history points: 3
+
+  Checked 50 metrics with 3+ history points.
+  Found 5 anomalies  (2 already above static thresholds, 3 below thresholds but growing abnormally)
+
+  BELOW-THRESHOLD ANOMALIES  —  growing fast but not yet CRITICAL/HIGH
+  These would be MISSED by a static threshold scan.
+  Metric                                             Current   7d Avg   Ratio  Samples  Severity
+  http.client.request.duration_bucket                    480      120    4.0x        8  [MED]
+  db.client.connections.wait_time_bucket                 240       60    4.0x        5  [LOW]
+  container.cpu.usage                                    190       80    2.4x        6  [LOW]
+
+  ABOVE-THRESHOLD ANOMALIES  —  flagged by static scan AND growing abnormally fast
+  Metric                                             Current   7d Avg   Ratio  Samples  Severity
+  k8s.pod.phase                                        1,500      400    3.8x        7  [HIGH]
+
+  Top hidden anomaly: 'http.client.request.duration_bucket'
+    Current MTS: 480  |  7-day avg: 120  |  Ratio: 4.0x  |  ~$0.96/mo
+    Run: python3 cardinality_governance.py rollup --metric "http.client.request.duration_bucket"
+```
+
+**Why this matters:** static thresholds (`CRITICAL >= 10,000`) miss metrics that are growing quickly but haven't crossed the line yet. A metric at 800 MTS growing 4x per week will be at 50,000 MTS within two weeks. Anomaly scan catches it now while it's still cheap to fix.
+
+**The anomaly flag also appears in regular `scan` output:**
+```
+Rank  Metric                               MTS   Trend        Severity
+1     http.client.request.duration_bucket  480   GROWING      MEDIUM    [ANOMALY 4.0x]
+```
+
+**Options:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--ratio` | 2.0 | Flag if current MTS >= N × baseline average |
+| `--days` | 7 | Baseline window length |
+| `--min-samples` | 3 | Minimum scan history points required |
+| `--top` | 20 | Max anomalies to show per section |
+
+**Tip:** Override the default ratio globally:
+```bash
+export ANOMALY_RATIO=1.5        # more sensitive
+export ANOMALY_MIN_SAMPLES=2    # less history required
+```
