@@ -1543,14 +1543,14 @@ def generate_html_report(findings, use_claude=True):
         limit_html = (f'<span style="font-size:12px;color:var(--muted)">{pct_used}% of org MTS limit</span>'
                       if pct_used is not None else "")
         return f"""
-  <div class="card" style="border-left:6px solid {grade_color};background:linear-gradient(135deg,var(--hover) 0%,var(--surface) 100%);margin-bottom:16px">
+  <div class="card" style="border-left:6px solid {grade_color};background:linear-gradient(135deg,var(--hover) 0%,var(--surface) 100%);margin-bottom:16px;color:var(--text)">
     <div style="display:flex;align-items:center;gap:24px;flex-wrap:wrap">
       <div style="text-align:center;min-width:80px">
         <div style="font-size:56px;font-weight:900;line-height:1;color:{grade_color}">{grade}</div>
         <div style="font-size:12px;color:var(--muted);margin-top:2px">Governance Score</div>
         <div style="font-size:22px;font-weight:700;color:{grade_color}">{health_score}/100</div>
       </div>
-      <div style="flex:1;min-width:200px">
+      <div style="flex:1;min-width:200px;color:var(--text)">
         <div style="font-size:13px;color:var(--muted);margin-bottom:6px">
           <strong style="color:#ef4444">{len(critical)}</strong> Critical &nbsp;·&nbsp;
           <strong style="color:#f97316">{len(high)}</strong> High &nbsp;·&nbsp;
@@ -1559,7 +1559,7 @@ def generate_html_report(findings, use_claude=True):
           <strong>~${total_cost:,.2f}/mo</strong>
         </div>
         <div style="margin-bottom:10px">{trend_html} {limit_html}</div>
-        {"<ul style='margin:0;padding-left:0;list-style:none'>" + action_items + "</ul>" if action_items else ""}
+        {"<ul style='margin:0;padding-left:0;list-style:none;color:var(--text)'>" + action_items + "</ul>" if action_items else ""}
       </div>
     </div>
   </div>"""
@@ -1604,11 +1604,11 @@ def generate_html_report(findings, use_claude=True):
         # alert banners
         if growing:
             names = ", ".join(f"<code>{_h(f['metric'])}</code>" for f in growing[:3])
-            html += f'<div style="background:#fef2f2;border:1px solid #fca5a5;border-radius:8px;padding:10px 14px;margin-top:12px;font-size:12px">📈 <strong>{len(growing)} metric(s) growing &gt;20%</strong> since last scan: {names}{"..." if len(growing)>3 else ""}</div>'
+            html += f'<div style="background:#ef444422;border:1px solid #ef444466;border-radius:8px;padding:10px 14px;margin-top:12px;font-size:12px;color:var(--text)">📈 <strong>{len(growing)} metric(s) growing &gt;20%</strong> since last scan: {names}{"..." if len(growing)>3 else ""}</div>'
         if new_metrics:
-            html += f'<div style="background:#eff6ff;border:1px solid #93c5fd;border-radius:8px;padding:10px 14px;margin-top:8px;font-size:12px">🆕 <strong>{len(new_metrics)} new metric(s)</strong> appeared since last scan</div>'
+            html += f'<div style="background:#3b82f622;border:1px solid #3b82f666;border-radius:8px;padding:10px 14px;margin-top:8px;font-size:12px;color:var(--text)">🆕 <strong>{len(new_metrics)} new metric(s)</strong> appeared since last scan</div>'
         if saved_mts:
-            html += f'<div style="background:#f0fdf4;border:1px solid #86efac;border-radius:8px;padding:10px 14px;margin-top:8px;font-size:12px">✅ <strong>Cumulative savings:</strong> {saved_mts:,} MTS / ~${saved_cost:,.2f}/mo across {len(all_resolved)} resolved metric(s)</div>'
+            html += f'<div style="background:#22c55e22;border:1px solid #22c55e66;border-radius:8px;padding:10px 14px;margin-top:8px;font-size:12px;color:var(--text)">✅ <strong>Cumulative savings:</strong> {saved_mts:,} MTS / ~${saved_cost:,.2f}/mo across {len(all_resolved)} resolved metric(s)</div>'
         return html
 
     def _pills(values, color):
@@ -1862,10 +1862,10 @@ def generate_html_report(findings, use_claude=True):
                                if f.get("instr_desc") else ""))
 
             # Metric metadata cell
-            type_badge  = f'<span style="background:#e2e8f0;border-radius:4px;padding:1px 6px;font-size:11px">{_h(f["type"])}</span>'
-            custom_badge= (f' <span style="background:#fef3c7;color:#92400e;border-radius:4px;padding:1px 6px;font-size:11px">custom</span>'
+            type_badge  = f'<span style="background:var(--hover);border:1px solid var(--border);border-radius:4px;padding:1px 6px;font-size:11px">{_h(f["type"])}</span>'
+            custom_badge= (f' <span style="background:#f9731622;color:#f97316;border:1px solid #f9731644;border-radius:4px;padding:1px 6px;font-size:11px">custom</span>'
                            if f.get("custom") else
-                           f' <span style="background:#f0fdf4;color:#166534;border-radius:4px;padding:1px 6px;font-size:11px">builtin</span>')
+                           f' <span style="background:#22c55e22;color:#22c55e;border:1px solid #22c55e44;border-radius:4px;padding:1px 6px;font-size:11px">builtin</span>')
             limit_line  = (f'<br><span style="font-size:11px;color:var(--muted)">{f["limit_pct"]}% of org limit</span>'
                            if f.get("limit_pct") is not None else "")
             h += _ctx_cell("Metric Type", type_badge + custom_badge + limit_line)
