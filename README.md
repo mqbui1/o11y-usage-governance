@@ -504,64 +504,95 @@ Date                    Metrics  Total MTS  Est Cost/Mo   CRIT  HIGH  MED  Ignor
 Trend over 7 scans: DOWN 21.3%  (-2,650 MTS / ~-$5.30/mo)
 ```
 
-### HTML report
+### How to read the HTML report
 
 ```bash
 python3 cardinality_governance.py report --format html --no-ai
 ```
 
-Self-contained `.html` file. Sections:
+Self-contained `.html` file saved to `reports/`. Open in any browser — no server required.
 
-| Section | Contents |
-|---------|----------|
-| Executive Summary | Governance grade (A–F), score/100, key signals at a glance |
-| Recommended Actions | Prioritised action list (critical → low) with category and detail |
-| Overview | Stat grid (critical/high/medium/MTS/cost/savings) + alert banners |
-| Top Offenders | Sortable table: metric, MTS, cost, severity, trend, source, worst dimension, services |
-| Per-Service Scorecard | MTS and cost attributed per service with % bar |
-| Duplicate / Similar Groups | Metrics sharing the same high-cardinality dimension — collapsible OTel Collector YAML fix |
-| Resolved Findings | Peak vs current MTS, savings, how (auto/manual) |
-| Detailed Findings | Per-metric collapsible: dimension table, anti-pattern detection, AI remediation |
-| Scan History | MTS/cost/severity trend across past scans |
-| Ignored Patterns | Active glob patterns suppressed from reports |
+#### Navigation
 
-**Report features:**
-- Sidebar navigation with search — jump to any section instantly
-- Sticky summary bar — grade, MTS total, critical/growing counts always visible
-- Dark / light mode toggle
-- Sortable tables (click any column header)
-- Print-friendly layout
-- Collapsible sections — expand/collapse each card
+- **Sticky bar** (top) — governance grade, score/100, critical/high/medium counts, total MTS, and estimated monthly cost always visible while scrolling
+- **Sidebar** (left) — jump to any section; type in the search box to filter cards by keyword
+- **Dark mode / Print** — buttons in the top-right of the header
 
-**Sample layout:**
+#### Section by section
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│ [sticky bar]  C  45/100  |  3 critical  2 high  |  15,250 MTS  ~$30.50/mo  │
-├──────────┬──────────────────────────────────────────────────────────────────┤
-│ Sections │  Splunk Observability — Cardinality Governance          [🌙][🖨] │
-│          │  realm=us1 | generated 2026-04-23 | 48 metrics analyzed          │
-│ Overview │                                                                   │
-│ Actions  │  ┌─ C  45/100 ─────────────────────────────────────────────────┐ │
-│ Offend.  │  │  3 Critical  2 High  3 Medium  ·  15,250 MTS  ·  ~$30.50/mo │ │
-│ Scorecard│  │  ▲ 2 growing  ·  1 anomaly                                   │ │
-│ Groups   │  │  [critical] Fix CRITICAL metric: http.client.request.duration │ │
-│ Resolved │  └──────────────────────────────────────────────────────────────┘ │
-│ Details  │                                                                   │
-│ History  │  ▼ Recommended Actions                                            │
-│ Ignored  │    critical  Cardinality  Fix CRITICAL: http.client.request...   │
-│          │    high      Trend        2 metrics growing >20%                  │
-│          │    high      Anomaly      1 metric above 7-day baseline           │
-│          │                                                                   │
-│          │  ▼ Overview                                                       │
-│          │    3 CRIT  2 HIGH  3 MED  |  15,250 MTS  |  ~$30.50/mo          │
-│          │                                                                   │
-│          │  ▼ Top Offenders (sortable)                                       │
-│          │    #  Metric                     MTS    Cost    Sev   Trend       │
-│          │    1  http.client.req.duration  12,500  $25.00  CRIT  GROWING    │
-│          │    2  k8s.pod.phase              2,100   $4.20  HIGH  STABLE     │
-└──────────┴───────────────────────────────────────────────────────────────────┘
-```
+**Executive Summary**
+
+The large letter grade at the top. Score is penalised by finding severity weighted by `log10(mts_count)` — a single 50k-MTS explosion hurts far more than ten 200-MTS findings.
+
+| Grade | Score | Meaning |
+|-------|-------|---------|
+| A | ≥80 | Healthy — minor issues only |
+| B | ≥65 | Good — a few metrics to address |
+| C | ≥50 | Moderate — cardinality growing, action needed |
+| D | ≥35 | Poor — significant cost exposure |
+| F | <35 | Critical — immediate intervention required |
+
+**Recommended Actions**
+
+Prioritised list of the highest-impact things to do right now — capacity warnings, specific metrics to fix, anomaly and trend alerts.
+
+**Overview**
+
+Stat tiles: Critical / High / Medium counts, total MTS, estimated $/mo, org limit %, growing count, anomaly count. Alert banners appear for metrics growing >20% or new metrics since the last scan.
+
+**Top Offenders**
+
+Sortable table of the worst metrics by MTS.
+
+| Column | What it tells you |
+|--------|-------------------|
+| **Metric** | Metric name. `↗` cross-links to its Detailed Finding entry below. A red `2.4x` badge means the metric is growing faster than its 7-day baseline (anomaly) |
+| **MTS** | Current metric time series count |
+| **Est. Cost/Mo** | MTS × cost rate (default $0.002/MTS) |
+| **Severity** | CRITICAL ≥10k · HIGH ≥1k · MEDIUM ≥500 |
+| **Trend** | GROWING (>20% since last scan) · NEW · STABLE · SHRINKING |
+| **Source** | Detected instrumentation origin (OTel SDK, Splunk Agent, etc.) |
+| **Worst Dimension** | The single dimension with the highest unique value count — the root cause of the cardinality explosion |
+| **Services** | Owning services. Click **Show more columns ▼** to also reveal Environments and Cluster/NS columns |
+
+**Per-Service Scorecard**
+
+Every service ranked by total MTS contribution. The `% of Total` bar shows relative share. Environments and Cluster/NS show where each service runs.
+
+**Instrumentation Source Breakdown**
+
+Bar chart of MTS and cost by instrumentation type (OTel SDK, Splunk Agent, custom, etc.). Use this to target remediation at a specific team or SDK.
+
+**Duplicate / Similar Groups**
+
+Two sub-sections:
+
+- *Grouped by Shared Worst Dimension* — multiple metrics that all explode because of the same high-cardinality dimension (e.g. `request_id`). One OTel Collector filter resolves the entire group. Shows combined MTS, combined cost, and estimated savings (~70% MTS reduction).
+- *Grouped by Metric Name Prefix (Histogram Family)* — siblings of the same histogram (e.g. `http.request.duration_bucket`, `_count`, `_sum`). Fixing the worst dimension on any one fixes all siblings.
+
+Each group has an expandable **Fix YAML** section with a **Copy** button — paste directly into your OTel Collector config.
+
+**Resolved Findings**
+
+Previously high-cardinality metrics that have since been fixed. The green savings bar is scaled relative to the largest single saving in the set so you can compare impact across resolutions at a glance.
+
+**Detailed Findings**
+
+One collapsible row per metric. Expand any row to see:
+
+- **Context grid** — Services, Environments, Clusters, Namespaces, Sample Pods, Instrumentation source, Metric type (custom vs builtin), Trend with peak MTS date, SDK version
+- **Dimension table** — all dimensions ranked by unique value count. The **% of Worst** bar shows each dimension's share relative to the worst one; red = the main offender to fix
+- **OTel Collector Fix YAML** — ready-to-paste `filter_processor` (drop the dimension) with a **Copy** button, plus an alternative `transform_processor` (hash instead of drop)
+- **AI Remediation** — Claude-generated analysis (skipped with `--no-ai`)
+
+**Scan History**
+
+Past scans newest-first. The inline **sparkline** shows the MTS trend direction across all stored scans. The **Δ MTS** column shows change since the previous scan — green means cardinality is decreasing, red means it is still growing. The oldest scan row shows `—` since there is no prior point to compare.
+
+**Ignored Patterns**
+
+Metric patterns excluded from scanning (e.g. `sf.org.*`). Tracks intentional suppressions so they don't silently hide real issues.
+
 
 ### Watch mode
 
